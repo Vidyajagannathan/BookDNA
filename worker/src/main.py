@@ -1,90 +1,106 @@
-from workers import WorkerEntrypoint
-import asgi
-from fastapi import FastAPI, Request, Response, HTTPException
-from pydantic import BaseModel, Field
-from js import fetch
-import hashlib
-import secrets
-from urllib.parse import quote
-
+from workers import WorkerEntrypoint, Response
 from durable.identity import IdentityDO
 from durable.user import UserDO
 from durable.catalog import CatalogShardDO
 from dna.mappings import map_subjects
 from security.tokens import create_token, verify_token
+from js import fetch
+from urllib.parse import urlparse, parse_qs, quote, unquote
+import hashlib
+import secrets
+import json
 
-app=FastAPI(title="BookDNA API",version="0.1.0",docs_url=None,redoc_url=None)
+def reply(data, status=200, headers=None):
+    base={"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store"}
+    if headers: base.update(headers)
+    return Response(json.dumps(data,separators=(",",":")),status=status,headers=base)
 
-class Default(WorkerEntrypoint):
-    async def fetch(self,request): return await asgi.fetch(app,request,self.env)
-
-class RegisterBody(BaseModel):
-    username:str=Field(min_length=3,max_length=30,pattern=r"^[A-Za-z0-9_]+$"); email:str=Field(max_length=254); password:str=Field(min_length=8,max_length=128)
-class LoginBody(BaseModel): identifier:str=Field(min_length=1,max_length=254); password:str=Field(min_length=1,max_length=128)
-class LibraryBody(BaseModel): book:dict; status:str; rating:float|None=Field(default=None,ge=.5,le=5); favourite:bool=False
-
-def env(req): return req.scope["env"]
-def secret(req):
-    value=getattr(env(req),"JWT_SECRET",None)
-    if not value and getattr(env(req),"APP_ENV","development")=="production":
-        raise HTTPException(503,"Service authentication is not configured")
-    return str(value or "local-development-only-change-me")
-def identity(req): return env(req).IDENTITY.get_by_name("primary")
-def current_user(req):
-    token=req.cookies.get("bookdna_access"); data=verify_token(token,secret(req)) if token else None
-    if not data: raise HTTPException(401,"Sign in required")
-    return data
-def origin_guard(req):
-    origin=req.headers.get("origin"); host=req.headers.get("host")
-    if origin and host and host not in origin: raise HTTPException(403,"Invalid request origin")
-def set_auth(response,user,req):
-    sid=secrets.token_hex(12); token=create_token(user["id"],sid,secret(req)); secure=getattr(env(req),"APP_ENV","development")=="production"
-    response.set_cookie("bookdna_access",token,max_age=900,httponly=True,secure=secure,samesite="lax",path="/")
-
-@app.get("/api/health")
-async def health(): return {"status":"ok","service":"bookdna"}
-
-@app.post("/api/auth/register")
-async def register(body:RegisterBody,req:Request,response:Response):
-    origin_guard(req); user=await identity(req).register(body.username,body.email,body.password)
-    if user.get("error"): raise HTTPException(409,user["error"])
-    await env(req).USERS.get_by_name(user["id"]).initialize(user["id"],user["username"]); set_auth(response,user,req); return user
-
-@app.post("/api/auth/login")
-async def login(body:LoginBody,req:Request,response:Response):
-    origin_guard(req); user=await identity(req).authenticate(body.identifier,body.password)
-    if user.get("error"): raise HTTPException(401,user["error"])
-    set_auth(response,user,req); return user
-
-@app.post("/api/auth/logout")
-async def logout(req:Request,response:Response): origin_guard(req); response.delete_cookie("bookdna_access",path="/"); return {"ok":True}
-
-@app.get("/api/auth/me")
-async def me(req:Request):
-    data=current_user(req); username=await identity(req).username_for(data["sub"]); return {"id":data["sub"],"username":username}
-
-@app.get("/api/books/search")
-async def search_books(q:str,req:Request):
-    if len(q.strip())<2: raise HTTPException(422,"Search must be at least 2 characters")
-    headers={"User-Agent":str(getattr(env(req),"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}; result=await fetch(f"https://openlibrary.org/search.json?q={quote(q)}&limit=12&fields=key,title,author_name,first_publish_year,cover_i,subject",{"headers":headers}); data=(await result.json()).to_py()
-    books=[]
-    for item in data.get("docs",[]):
-        key=str(item.get("key","")).split("/")[-1]
-        if not key: continue
-        books.append({"id":key,"title":item.get("title","Untitled"),"author":(item.get("author_name") or ["Unknown author"])[0],"year":item.get("first_publish_year"),"cover_url":f"https://covers.openlibrary.org/b/id/{item['cover_i']}-L.jpg" if item.get("cover_i") else None,"subjects":(item.get("subject") or [])[:20]})
-    return {"books":books}
-
-@app.get("/api/library")
-async def library(req:Request): data=current_user(req); return {"books":await env(req).USERS.get_by_name(data["sub"]).library()}
-
-@app.put("/api/library/{book_id}")
-async def update_library(book_id:str,body:LibraryBody,req:Request):
-    origin_guard(req); data=current_user(req)
-    if body.book.get("id")!=book_id: raise HTTPException(422,"Book identifier mismatch")
-    traits=map_subjects(body.book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await env(req).CATALOG.get_by_name(f"catalog:{shard}").put_book(body.book,traits)
-    result=await env(req).USERS.get_by_name(data["sub"]).upsert_book(body.book,body.status,body.rating,body.favourite,traits)
-    if result.get("error"): raise HTTPException(422,result["error"])
+def cookies(request):
+    result={}
+    for part in (request.headers.get("Cookie") or "").split(";"):
+        if "=" in part:
+            key,value=part.strip().split("=",1); result[key]=value
     return result
 
-@app.get("/api/dna/me")
-async def dna(req:Request): data=current_user(req); return await env(req).USERS.get_by_name(data["sub"]).dna()
+class Default(WorkerEntrypoint):
+    def signing_secret(self):
+        value=getattr(self.env,"JWT_SECRET",None)
+        if not value and getattr(self.env,"APP_ENV","development")=="production": raise RuntimeError("Authentication is not configured")
+        return str(value or "local-development-only-change-me")
+
+    def user(self,request):
+        token=cookies(request).get("bookdna_access"); return verify_token(token,self.signing_secret()) if token else None
+
+    def origin_ok(self,request):
+        origin=request.headers.get("Origin"); host=request.headers.get("Host"); return not origin or not host or host in origin
+
+    def auth_cookie(self,user):
+        token=create_token(user["id"],secrets.token_hex(12),self.signing_secret())
+        secure="; Secure" if getattr(self.env,"APP_ENV","development")=="production" else ""
+        return f"bookdna_access={token}; Path=/; Max-Age=900; HttpOnly; SameSite=Lax{secure}"
+
+    async def fetch(self,request):
+        try:
+            url=urlparse(request.url); path=url.path; method=request.method.upper()
+            if not path.startswith("/api/"): return await self.env.ASSETS.fetch(request)
+            if method in ("POST","PUT","PATCH","DELETE") and not self.origin_ok(request): return reply({"detail":"Invalid request origin"},403)
+            if path=="/api/health" and method=="GET": return reply({"status":"ok","service":"bookdna"})
+            if path=="/api/auth/register" and method=="POST": return await self.register(request)
+            if path=="/api/auth/login" and method=="POST": return await self.login(request)
+            if path=="/api/auth/logout" and method=="POST": return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
+            if path=="/api/auth/me" and method=="GET": return await self.me(request)
+            if path=="/api/books/search" and method=="GET": return await self.search(parse_qs(url.query).get("q",[""])[0])
+            if path=="/api/library" and method=="GET": return await self.library(request)
+            if path.startswith("/api/library/") and method=="PUT": return await self.update_library(request,unquote(path.removeprefix("/api/library/")))
+            if path=="/api/dna/me" and method=="GET": return await self.dna(request)
+            return reply({"detail":"Not found"},404)
+        except Exception as exc:
+            print(f"BookDNA request error: {type(exc).__name__}: {exc}")
+            return reply({"detail":"Internal service error"},500)
+
+    async def body(self,request):
+        data=await request.json(); return data.to_py() if hasattr(data,"to_py") else data
+
+    async def register(self,request):
+        body=await self.body(request); username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip(); password=str(body.get("password",""))
+        if len(username)<3 or len(username)>30 or not username.replace("_","").isalnum() or "@" not in email or len(password)<8: return reply({"detail":"Invalid registration details"},422)
+        identity=self.env.IDENTITY.get_by_name("primary"); user=await identity.register(username,email,password)
+        if user.get("error"): return reply({"detail":user["error"]},409)
+        await self.env.USERS.get_by_name(user["id"]).initialize(user["id"],user["username"])
+        return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
+
+    async def login(self,request):
+        body=await self.body(request); user=await self.env.IDENTITY.get_by_name("primary").authenticate(str(body.get("identifier","")),str(body.get("password","")))
+        if user.get("error"): return reply({"detail":user["error"]},401)
+        return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
+
+    async def me(self,request):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        username=await self.env.IDENTITY.get_by_name("primary").username_for(user["sub"]); return reply({"id":user["sub"],"username":username})
+
+    async def search(self,query):
+        if len(query.strip())<2: return reply({"detail":"Search must be at least 2 characters"},422)
+        result=await fetch(f"https://openlibrary.org/search.json?q={quote(query)}&limit=12&fields=key,title,author_name,first_publish_year,cover_i,subject",{"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}}); data=(await result.json()).to_py(); books=[]
+        for item in data.get("docs",[]):
+            key=str(item.get("key","")).split("/")[-1]
+            if key: books.append({"id":key,"title":item.get("title","Untitled"),"author":(item.get("author_name") or ["Unknown author"])[0],"year":item.get("first_publish_year"),"cover_url":f"https://covers.openlibrary.org/b/id/{item['cover_i']}-L.jpg" if item.get("cover_i") else None,"subjects":(item.get("subject") or [])[:20]})
+        return reply({"books":books})
+
+    async def library(self,request):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        return reply({"books":await self.env.USERS.get_by_name(user["sub"]).library()})
+
+    async def update_library(self,request,book_id):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False))
+        if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)): return reply({"detail":"Invalid library update"},422)
+        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.get_by_name(f"catalog:{shard}").put_book(book,traits); result=await self.env.USERS.get_by_name(user["sub"]).upsert_book(book,status,rating,favourite,traits)
+        return reply(result)
+
+    async def dna(self,request):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        return reply(await self.env.USERS.get_by_name(user["sub"]).dna())

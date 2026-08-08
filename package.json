@@ -6,8 +6,7 @@
     "build": "npm --prefix frontend run build",
     "check": "npm --prefix frontend run check",
     "test": "python -m unittest discover -s tests -v",
-    "worker:dev": "uv run pywrangler dev",
-    "deploy": "npm run build && uv run pywrangler deploy"
+    "worker:dev": "wrangler dev",
+    "deploy": "npm run build && wrangler deploy"
   }
 }
-

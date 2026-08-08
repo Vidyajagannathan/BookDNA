@@ -3,6 +3,10 @@ frontend/dist/
 .wrangler/
 .wrangler-dry-run/
 .venv/
+.venv-workers/
+python_modules/
+pylock.toml
+uv.lock
 __pycache__/
 *.pyc
 *.tsbuildinfo

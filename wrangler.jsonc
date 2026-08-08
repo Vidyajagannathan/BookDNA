@@ -2,8 +2,9 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "bookdna",
   "main": "worker/src/main.py",
-  "compatibility_date": "2026-08-08",
-  "compatibility_flags": ["python_workers"],
+  "compatibility_date": "2026-07-28",
+  "compatibility_flags": ["python_workers", "disable_python_external_sdk"],
+  "workers_dev": true,
   "assets": {
     "directory": "./frontend/dist",
     "binding": "ASSETS",
@@ -28,4 +29,3 @@
   },
   "observability": { "enabled": true }
 }
-
