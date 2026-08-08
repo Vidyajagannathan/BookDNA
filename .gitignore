@@ -1,0 +1,12 @@
+node_modules/
+frontend/dist/
+.wrangler/
+.wrangler-dry-run/
+.venv/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+.dev.vars
+.DS_Store

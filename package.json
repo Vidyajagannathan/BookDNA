@@ -1,0 +1,13 @@
+{
+  "name": "bookdna",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "check": "npm --prefix frontend run check",
+    "test": "python -m unittest discover -s tests -v",
+    "worker:dev": "uv run pywrangler dev",
+    "deploy": "npm run build && uv run pywrangler deploy"
+  }
+}
+
