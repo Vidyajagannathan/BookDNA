@@ -9,6 +9,11 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 import hashlib
 import secrets
 import json
+import traceback
+
+def native(value):
+    """Convert values crossing the JS/Durable Object RPC boundary."""
+    return value.to_py() if hasattr(value,"to_py") else value
 
 def reply(data, status=200, headers=None):
     base={"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store"}
@@ -44,7 +49,7 @@ class Default(WorkerEntrypoint):
             url=urlparse(request.url); path=url.path; method=request.method.upper()
             if not path.startswith("/api/"): return await self.env.ASSETS.fetch(request)
             if method in ("POST","PUT","PATCH","DELETE") and not self.origin_ok(request): return reply({"detail":"Invalid request origin"},403)
-            if path=="/api/health" and method=="GET": return reply({"status":"ok","service":"bookdna"})
+            if path=="/api/health" and method=="GET": return reply({"status":"ok","service":"bookdna","build":"auth-rpc-fix-20260809"})
             if path=="/api/auth/register" and method=="POST": return await self.register(request)
             if path=="/api/auth/login" and method=="POST": return await self.login(request)
             if path=="/api/auth/logout" and method=="POST": return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
@@ -56,28 +61,29 @@ class Default(WorkerEntrypoint):
             return reply({"detail":"Not found"},404)
         except Exception as exc:
             print(f"BookDNA request error: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
             return reply({"detail":"Internal service error"},500)
 
     async def body(self,request):
-        data=await request.json(); return data.to_py() if hasattr(data,"to_py") else data
+        return native(await request.json())
 
     async def register(self,request):
         body=await self.body(request); username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip(); password=str(body.get("password",""))
         if len(username)<3 or len(username)>30 or not username.replace("_","").isalnum() or "@" not in email or len(password)<8: return reply({"detail":"Invalid registration details"},422)
-        identity=self.env.IDENTITY.get_by_name("primary"); user=await identity.register(username,email,password)
+        identity=self.env.IDENTITY.getByName("primary"); user=native(await identity.register(username,email,password))
         if user.get("error"): return reply({"detail":user["error"]},409)
-        await self.env.USERS.get_by_name(user["id"]).initialize(user["id"],user["username"])
+        await self.env.USERS.getByName(user["id"]).initialize(user["id"],user["username"])
         return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
 
     async def login(self,request):
-        body=await self.body(request); user=await self.env.IDENTITY.get_by_name("primary").authenticate(str(body.get("identifier","")),str(body.get("password","")))
+        body=await self.body(request); user=native(await self.env.IDENTITY.getByName("primary").authenticate(str(body.get("identifier","")),str(body.get("password",""))))
         if user.get("error"): return reply({"detail":user["error"]},401)
         return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
 
     async def me(self,request):
         user=self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        username=await self.env.IDENTITY.get_by_name("primary").username_for(user["sub"]); return reply({"id":user["sub"],"username":username})
+        username=await self.env.IDENTITY.getByName("primary").username_for(user["sub"]); return reply({"id":user["sub"],"username":username})
 
     async def search(self,query):
         if len(query.strip())<2: return reply({"detail":"Search must be at least 2 characters"},422)
@@ -90,17 +96,17 @@ class Default(WorkerEntrypoint):
     async def library(self,request):
         user=self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        return reply({"books":await self.env.USERS.get_by_name(user["sub"]).library()})
+        return reply({"books":native(await self.env.USERS.getByName(user["sub"]).library())})
 
     async def update_library(self,request,book_id):
         user=self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False))
         if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)): return reply({"detail":"Invalid library update"},422)
-        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.get_by_name(f"catalog:{shard}").put_book(book,traits); result=await self.env.USERS.get_by_name(user["sub"]).upsert_book(book,status,rating,favourite,traits)
+        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits))
         return reply(result)
 
     async def dna(self,request):
         user=self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        return reply(await self.env.USERS.get_by_name(user["sub"]).dna())
+        return reply(native(await self.env.USERS.getByName(user["sub"]).dna()))

@@ -2,6 +2,10 @@ node_modules/
 frontend/dist/
 .wrangler/
 .wrangler-dry-run/
+.wrangler-local/
+tail.log
+tail.err.log
+tail.pid
 .venv/
 .venv-workers/
 python_modules/
