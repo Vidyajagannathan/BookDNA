@@ -4,7 +4,8 @@ from durable.user import UserDO
 from durable.catalog import CatalogShardDO
 from dna.mappings import map_subjects
 from security.tokens import create_token, verify_token
-from js import fetch
+from js import fetch, Object
+from pyodide.ffi import to_js as _to_js
 from urllib.parse import urlparse, parse_qs, quote, unquote
 import hashlib
 import secrets
@@ -14,6 +15,10 @@ import traceback
 def native(value):
     """Convert values crossing the JS/Durable Object RPC boundary."""
     return value.to_py() if hasattr(value,"to_py") else value
+
+def js_object(value):
+    """Convert Python mappings into plain JavaScript objects for Web APIs."""
+    return _to_js(value,dict_converter=Object.fromEntries)
 
 def reply(data, status=200, headers=None):
     base={"Content-Type":"application/json; charset=utf-8","Cache-Control":"no-store"}
@@ -37,7 +42,11 @@ class Default(WorkerEntrypoint):
         token=cookies(request).get("bookdna_access"); return verify_token(token,self.signing_secret()) if token else None
 
     def origin_ok(self,request):
-        origin=request.headers.get("Origin"); host=request.headers.get("Host"); return not origin or not host or host in origin
+        origin=request.headers.get("Origin"); host=request.headers.get("Host")
+        if not origin or not host: return True
+        if getattr(self.env,"APP_ENV","development")!="production": return True
+        parsed=urlparse(origin)
+        return parsed.scheme=="https" and parsed.netloc==host
 
     def auth_cookie(self,user):
         token=create_token(user["id"],secrets.token_hex(12),self.signing_secret())
@@ -87,7 +96,8 @@ class Default(WorkerEntrypoint):
 
     async def search(self,query):
         if len(query.strip())<2: return reply({"detail":"Search must be at least 2 characters"},422)
-        result=await fetch(f"https://openlibrary.org/search.json?q={quote(query)}&limit=12&fields=key,title,author_name,first_publish_year,cover_i,subject",{"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}}); data=(await result.json()).to_py(); books=[]
+        options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
+        result=await fetch(f"https://openlibrary.org/search.json?q={quote(query)}&limit=12&fields=key,title,author_name,first_publish_year,cover_i,subject",options); data=native(await result.json()); books=[]
         for item in data.get("docs",[]):
             key=str(item.get("key","")).split("/")[-1]
             if key: books.append({"id":key,"title":item.get("title","Untitled"),"author":(item.get("author_name") or ["Unknown author"])[0],"year":item.get("first_publish_year"),"cover_url":f"https://covers.openlibrary.org/b/id/{item['cover_i']}-L.jpg" if item.get("cover_i") else None,"subjects":(item.get("subject") or [])[:20]})
