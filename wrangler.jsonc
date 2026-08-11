@@ -22,6 +22,14 @@
       { "name": "CATALOG", "class_name": "CatalogShardDO" }
     ]
   },
+  "d1_databases": [
+    {
+      "binding": "CATALOG_DB",
+      "database_name": "bookdna-catalog",
+      "database_id": "89f8116a-a9d4-4e57-b0d6-28979f9e12a2",
+      "migrations_dir": "migrations"
+    }
+  ],
   "exports": {
     "IdentityDO": { "type": "durable-object", "storage": "sqlite" },
     "UserDO": { "type": "durable-object", "storage": "sqlite" },

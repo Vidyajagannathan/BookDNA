@@ -11,6 +11,7 @@ import hashlib
 import secrets
 import json
 import traceback
+import re
 
 def native(value):
     """Convert values crossing the JS/Durable Object RPC boundary."""
@@ -58,12 +59,18 @@ class Default(WorkerEntrypoint):
             url=urlparse(request.url); path=url.path; method=request.method.upper()
             if not path.startswith("/api/"): return await self.env.ASSETS.fetch(request)
             if method in ("POST","PUT","PATCH","DELETE") and not self.origin_ok(request): return reply({"detail":"Invalid request origin"},403)
-            if path=="/api/health" and method=="GET": return reply({"status":"ok","service":"bookdna","build":"auth-rpc-fix-20260809"})
+            if path=="/api/health" and method=="GET": return reply({"status":"ok","service":"bookdna","build":"global-catalog-20260811"})
             if path=="/api/auth/register" and method=="POST": return await self.register(request)
             if path=="/api/auth/login" and method=="POST": return await self.login(request)
             if path=="/api/auth/logout" and method=="POST": return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
             if path=="/api/auth/me" and method=="GET": return await self.me(request)
-            if path=="/api/books/search" and method=="GET": return await self.search(parse_qs(url.query).get("q",[""])[0])
+            if path=="/api/books/search" and method=="GET": return await self.search(parse_qs(url.query))
+            if path=="/api/books/collections" and method=="GET": return reply({"collections":[
+                {"id":"fantasy","name":"Fantasy","query":"subject:fantasy"},{"id":"science-fiction","name":"Science fiction","query":"subject:science fiction"},
+                {"id":"romance","name":"Romance","query":"subject:romance"},{"id":"mystery","name":"Mystery & thrillers","query":"subject:mystery"},
+                {"id":"history","name":"History","query":"subject:history"},{"id":"biography","name":"Biography & memoir","query":"subject:biography"},
+                {"id":"philosophy","name":"Philosophy","query":"subject:philosophy"},{"id":"classics","name":"Classics","query":"subject:classics"}
+            ]})
             if path=="/api/library" and method=="GET": return await self.library(request)
             if path.startswith("/api/library/") and method=="PUT": return await self.update_library(request,unquote(path.removeprefix("/api/library/")))
             if path=="/api/dna/me" and method=="GET": return await self.dna(request)
@@ -94,14 +101,33 @@ class Default(WorkerEntrypoint):
         if not user: return reply({"detail":"Sign in required"},401)
         username=await self.env.IDENTITY.getByName("primary").username_for(user["sub"]); return reply({"id":user["sub"],"username":username})
 
-    async def search(self,query):
-        if len(query.strip())<2: return reply({"detail":"Search must be at least 2 characters"},422)
+    def book_from_openlibrary(self,item):
+        key=str(item.get("key","")).split("/")[-1]
+        return {"id":key,"title":item.get("title","Untitled"),"author":(item.get("author_name") or ["Unknown author"])[0],"year":item.get("first_publish_year"),"cover_url":f"https://covers.openlibrary.org/b/id/{item['cover_i']}-L.jpg" if item.get("cover_i") else None,"subjects":(item.get("subject") or [])[:20],"edition_count":item.get("edition_count",0),"isbn":(item.get("isbn") or [])[:10],"source":"openlibrary"}
+
+    async def cache_books(self,books):
+        database=getattr(self.env,"CATALOG_DB",None)
+        if not database: return
+        for book in books:
+            try:
+                cover_id=None
+                if book.get("cover_url"):
+                    match=re.search(r"/b/id/(\d+)-",book["cover_url"]); cover_id=int(match.group(1)) if match else None
+                await database.prepare("INSERT INTO catalog_works(id,title,author,first_publish_year,cover_id,subjects_json,source,updated_at) VALUES(?,?,?,?,?,?,?,unixepoch()) ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,first_publish_year=excluded.first_publish_year,cover_id=excluded.cover_id,subjects_json=excluded.subjects_json,updated_at=excluded.updated_at").bind(book["id"],book["title"],book["author"],book.get("year"),cover_id,json.dumps(book.get("subjects",[])),book.get("source","openlibrary")).run()
+                await database.prepare("DELETE FROM catalog_works_fts WHERE id=?").bind(book["id"]).run()
+                await database.prepare("INSERT INTO catalog_works_fts(id,title,author,subjects) VALUES(?,?,?,?)").bind(book["id"],book["title"],book["author"]," ".join(book.get("subjects",[]))).run()
+            except Exception as exc:
+                print(f"Catalog cache warning: {type(exc).__name__}: {exc}")
+
+    async def search(self,params):
+        query=str(params.get("q",[""])[0]).strip(); page=max(1,min(100,int(params.get("page",["1"])[0] or 1))); limit=max(4,min(40,int(params.get("limit",["24"])[0] or 24)))
+        if len(query)<2: return reply({"detail":"Search must be at least 2 characters"},422)
         options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
-        result=await fetch(f"https://openlibrary.org/search.json?q={quote(query)}&limit=12&fields=key,title,author_name,first_publish_year,cover_i,subject",options); data=native(await result.json()); books=[]
-        for item in data.get("docs",[]):
-            key=str(item.get("key","")).split("/")[-1]
-            if key: books.append({"id":key,"title":item.get("title","Untitled"),"author":(item.get("author_name") or ["Unknown author"])[0],"year":item.get("first_publish_year"),"cover_url":f"https://covers.openlibrary.org/b/id/{item['cover_i']}-L.jpg" if item.get("cover_i") else None,"subjects":(item.get("subject") or [])[:20]})
-        return reply({"books":books})
+        result=await fetch(f"https://openlibrary.org/search.json?q={quote(query)}&page={page}&limit={limit}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn",options)
+        if not result.ok: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
+        data=native(await result.json()); books=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
+        await self.cache_books(books)
+        total=int(data.get("numFound",0)); return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":page*limit<total,"source":"openlibrary"})
 
     async def library(self,request):
         user=self.user(request)
