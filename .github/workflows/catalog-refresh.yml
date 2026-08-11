@@ -1,0 +1,67 @@
+name: Catalog metadata refresh
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      record_limit:
+        description: Maximum records fetched from each incremental source
+        default: "10000"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalog-metadata-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CATALOG_WORK: ${{ runner.temp }}/bookdna-catalog
+      RECORD_LIMIT: ${{ inputs.record_limit || '10000' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: python -m pip install -e .
+      - run: npm ci
+      - name: Fetch free incremental sources
+        run: |
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" fetch crossref "$CATALOG_WORK/crossref.jsonl" --limit "$RECORD_LIMIT"
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" fetch datacite "$CATALOG_WORK/datacite.jsonl" --limit "$RECORD_LIMIT"
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" fetch doab "$CATALOG_WORK/doab.jsonl" --limit "$RECORD_LIMIT"
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" download https://www.gutenberg.org/cache/epub/feeds/pg_catalog.csv "$CATALOG_WORK/gutenberg.csv"
+      - name: Normalize and deduplicate
+        run: |
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" ingest crossref "$CATALOG_WORK/crossref.jsonl"
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" ingest datacite "$CATALOG_WORK/datacite.jsonl"
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" ingest doab "$CATALOG_WORK/doab.jsonl"
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" ingest gutenberg "$CATALOG_WORK/gutenberg.csv" --limit "$RECORD_LIMIT"
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" export-d1 "$CATALOG_WORK/d1" --incremental
+          python -m catalog_pipeline --workspace "$CATALOG_WORK" export-identifiers "$CATALOG_WORK/d1/identifiers.sql" --incremental
+      - name: Apply bounded D1 refresh
+        run: |
+          for shard in 0 1 2 3 4 5 6 7; do
+            npx wrangler d1 execute "bookdna-search-$shard" --remote --file "$CATALOG_WORK/d1/search-$shard.sql"
+          done
+          npx wrangler d1 execute bookdna-identifiers --remote --file "$CATALOG_WORK/d1/identifiers.sql"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: catalog-refresh-report-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bookdna-catalog/manifest.json
+            ${{ runner.temp }}/bookdna-catalog/d1/manifest.json
+          retention-days: 30

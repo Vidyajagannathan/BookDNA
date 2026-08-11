@@ -5,6 +5,10 @@
   "compatibility_date": "2026-07-28",
   "compatibility_flags": ["python_workers", "disable_python_external_sdk"],
   "workers_dev": true,
+  "routes": [
+    { "pattern": "bookdna.uk", "custom_domain": true },
+    { "pattern": "www.bookdna.uk", "custom_domain": true }
+  ],
   "assets": {
     "directory": "./frontend/dist",
     "binding": "ASSETS",
@@ -28,7 +32,16 @@
       "database_name": "bookdna-catalog",
       "database_id": "89f8116a-a9d4-4e57-b0d6-28979f9e12a2",
       "migrations_dir": "migrations"
-    }
+    },
+    { "binding": "CATALOG_SEARCH_0", "database_name": "bookdna-search-0", "database_id": "1daefaa7-e16f-4972-9378-a3b3fcd67441" },
+    { "binding": "CATALOG_SEARCH_1", "database_name": "bookdna-search-1", "database_id": "101ab66e-45dd-40ae-927a-3290be0570c0" },
+    { "binding": "CATALOG_SEARCH_2", "database_name": "bookdna-search-2", "database_id": "839e0506-bc09-4ec8-bc41-ae3271996201" },
+    { "binding": "CATALOG_SEARCH_3", "database_name": "bookdna-search-3", "database_id": "4b8ca21f-d430-4096-896d-42bcd039347b" },
+    { "binding": "CATALOG_SEARCH_4", "database_name": "bookdna-search-4", "database_id": "a48d1ead-7989-4e6a-aada-37ee4d45eec0" },
+    { "binding": "CATALOG_SEARCH_5", "database_name": "bookdna-search-5", "database_id": "3b00a999-5650-4f81-ade7-cfbebae4a405" },
+    { "binding": "CATALOG_SEARCH_6", "database_name": "bookdna-search-6", "database_id": "c8018a23-7da9-49b4-b832-0d445425bb33" },
+    { "binding": "CATALOG_SEARCH_7", "database_name": "bookdna-search-7", "database_id": "ec9a2005-fc23-4db6-8a5a-c6d285956741" },
+    { "binding": "CATALOG_IDENTIFIERS", "database_name": "bookdna-identifiers", "database_id": "838e41b4-b26e-4f7d-a5a3-f32f7a9baaf5" }
   ],
   "exports": {
     "IdentityDO": { "type": "durable-object", "storage": "sqlite" },

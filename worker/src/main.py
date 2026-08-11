@@ -12,6 +12,8 @@ import secrets
 import json
 import traceback
 import re
+import asyncio
+import base64
 
 def native(value):
     """Convert values crossing the JS/Durable Object RPC boundary."""
@@ -65,12 +67,16 @@ class Default(WorkerEntrypoint):
             if path=="/api/auth/logout" and method=="POST": return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
             if path=="/api/auth/me" and method=="GET": return await self.me(request)
             if path=="/api/books/search" and method=="GET": return await self.search(parse_qs(url.query))
+            if path=="/api/books/catalog/status" and method=="GET": return await self.catalog_status()
+            if path.startswith("/api/books/isbn/") and method=="GET": return await self.by_isbn(unquote(path.removeprefix("/api/books/isbn/")))
+            if path.startswith("/api/books/") and path.endswith("/editions") and method=="GET": return await self.book_editions(unquote(path.removeprefix("/api/books/").removesuffix("/editions")))
             if path=="/api/books/collections" and method=="GET": return reply({"collections":[
                 {"id":"fantasy","name":"Fantasy","query":"subject:fantasy"},{"id":"science-fiction","name":"Science fiction","query":"subject:science fiction"},
                 {"id":"romance","name":"Romance","query":"subject:romance"},{"id":"mystery","name":"Mystery & thrillers","query":"subject:mystery"},
                 {"id":"history","name":"History","query":"subject:history"},{"id":"biography","name":"Biography & memoir","query":"subject:biography"},
                 {"id":"philosophy","name":"Philosophy","query":"subject:philosophy"},{"id":"classics","name":"Classics","query":"subject:classics"}
             ]})
+            if path.startswith("/api/books/") and method=="GET": return await self.book_detail(unquote(path.removeprefix("/api/books/")))
             if path=="/api/library" and method=="GET": return await self.library(request)
             if path.startswith("/api/library/") and method=="PUT": return await self.update_library(request,unquote(path.removeprefix("/api/library/")))
             if path=="/api/dna/me" and method=="GET": return await self.dna(request)
@@ -119,15 +125,125 @@ class Default(WorkerEntrypoint):
             except Exception as exc:
                 print(f"Catalog cache warning: {type(exc).__name__}: {exc}")
 
+    def search_shards(self):
+        return [binding for index in range(8) if (binding:=getattr(self.env,f"CATALOG_SEARCH_{index}",None)) is not None]
+
+    def search_terms(self,query):
+        value=query.split(":",1)[-1] if query.startswith("subject:") else query
+        words=re.findall(r"[\w]+",value,flags=re.UNICODE)[:8]
+        return " AND ".join(f'"{word.replace(chr(34),"")}"*' for word in words)
+
+    async def local_shard_search(self,database,query,limit,offset,language=None,year_from=None,year_to=None,format_name=None):
+        terms=self.search_terms(query)
+        if not terms: return []
+        clauses=["search_works_fts MATCH ?"]; values=[terms]
+        if language: clauses.append("w.language=?"); values.append(language)
+        if year_from: clauses.append("CAST(substr(w.published,1,4) AS INTEGER)>=?"); values.append(year_from)
+        if year_to: clauses.append("CAST(substr(w.published,1,4) AS INTEGER)<=?"); values.append(year_to)
+        if format_name: clauses.append("lower(w.format)=lower(?)"); values.append(format_name)
+        sql=f"SELECT w.*,bm25(search_works_fts) rank FROM search_works_fts JOIN search_works w ON w.id=search_works_fts.id WHERE {' AND '.join(clauses)} ORDER BY rank,CASE w.quality WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,w.edition_count DESC LIMIT ? OFFSET ?"
+        values.extend([limit,offset]); result=native(await database.prepare(sql).bind(*values).all())
+        return result.get("results",[]) if isinstance(result,dict) else []
+
+    def local_book(self,row):
+        cover=row.get("cover_url"); year=None
+        if row.get("published"):
+            match=re.search(r"(?:1[0-9]{3}|20[0-9]{2})",str(row["published"])); year=int(match.group()) if match else None
+        return {"id":row["id"],"title":row.get("title") or "Untitled","author":row.get("author") or "Unknown author","year":year,"cover_url":cover,"subjects":[],"edition_count":int(row.get("edition_count") or 0),"source":"catalog","quality":row.get("quality"),"language":row.get("language"),"format":row.get("format"),"sources":json.loads(row.get("sources_json") or "[]")}
+
+    async def local_search(self,query,limit,offset,language=None,year_from=None,year_to=None,format_name=None):
+        shards=self.search_shards()
+        if not shards: return []
+        rows=[]
+        for start in range(0,len(shards),4):
+            results=await asyncio.gather(*(self.local_shard_search(database,query,limit,offset,language,year_from,year_to,format_name) for database in shards[start:start+4]))
+            for result in results: rows.extend(result)
+        rows.sort(key=lambda row:(float(row.get("rank",0)),{"A":0,"B":1,"C":2}.get(row.get("quality"),3),-int(row.get("edition_count") or 0)))
+        return [self.local_book(row) for row in rows[:limit]]
+
     async def search(self,params):
         query=str(params.get("q",[""])[0]).strip(); page=max(1,min(100,int(params.get("page",["1"])[0] or 1))); limit=max(4,min(40,int(params.get("limit",["24"])[0] or 24)))
+        cursor=str(params.get("cursor",[""])[0]); offset=(page-1)*limit
+        if cursor:
+            try: offset=max(0,int(base64.urlsafe_b64decode(cursor+"===").decode()))
+            except Exception: return reply({"detail":"Invalid search cursor"},422)
         if len(query)<2: return reply({"detail":"Search must be at least 2 characters"},422)
+        language=str(params.get("language",[""])[0]).strip() or None; format_name=str(params.get("format",[""])[0]).strip() or None
+        try: year_from=int(params.get("year_from",["0"])[0] or 0) or None; year_to=int(params.get("year_to",["0"])[0] or 0) or None
+        except ValueError: return reply({"detail":"Invalid year filter"},422)
+        mode=await self.catalog_mode(); local=[]
+        try: local=await self.local_search(query,limit,offset,language,year_from,year_to,format_name)
+        except Exception as exc: print(f"Local catalog search warning: {type(exc).__name__}: {exc}")
+        visible_local=local if mode in ("hybrid","local-first") else []
+        if len(visible_local)>=limit:
+            next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
+            return reply({"books":visible_local,"page":page,"limit":limit,"total":None,"has_more":True,"cursor":next_cursor,"source":"catalog"})
         options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
         result=await fetch(f"https://openlibrary.org/search.json?q={quote(query)}&page={page}&limit={limit}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn",options)
         if not result.ok: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
-        data=native(await result.json()); books=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
+        data=native(await result.json()); remote=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
+        seen={book["id"] for book in visible_local}; books=visible_local+[book for book in remote if book["id"] not in seen]; books=books[:limit]
         await self.cache_books(books)
-        total=int(data.get("numFound",0)); return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":page*limit<total,"source":"openlibrary"})
+        total=int(data.get("numFound",0)); next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
+        return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":page*limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary"})
+
+    async def catalog_mode(self):
+        database=getattr(self.env,"CATALOG_DB",None)
+        if not database: return "fallback"
+        try:
+            row=native(await database.prepare("SELECT value FROM catalog_settings WHERE key='mode'").first())
+            return str(row.get("value","shadow")) if isinstance(row,dict) else "shadow"
+        except Exception: return "shadow"
+
+    async def catalog_status(self):
+        database=getattr(self.env,"CATALOG_DB",None)
+        if not database: return reply({"mode":"fallback","sources":[],"indexed":0,"archive_bytes":0})
+        settings=native(await database.prepare("SELECT key,value FROM catalog_settings").all()); stats=native(await database.prepare("SELECT * FROM catalog_source_stats ORDER BY source").all())
+        indexed=0
+        for shard in self.search_shards():
+            try:
+                result=native(await shard.prepare("SELECT count(*) count FROM search_works").first()); indexed+=int(result.get("count",0)) if isinstance(result,dict) else 0
+            except Exception: pass
+        values={row["key"]:row["value"] for row in settings.get("results",[])}
+        return reply({"mode":values.get("mode","shadow"),"sources":stats.get("results",[]),"indexed":indexed,"archive_bytes":int(values.get("archive_bytes","0")),"quality":json.loads(values.get("quality","{}")),"last_refresh":values.get("last_refresh")})
+
+    async def book_detail(self,book_id):
+        for shard in self.search_shards():
+            row=native(await shard.prepare("SELECT * FROM search_works WHERE id=?").bind(book_id).first())
+            if row: return reply({"book":self.local_book(row),"editions":[]})
+        cached=await self.env.CATALOG.getByName(f"catalog:{hashlib.sha256(book_id.encode()).hexdigest()[:2]}").get_book(book_id)
+        if cached: return reply(native(cached))
+        return reply({"detail":"Book not found"},404)
+
+    async def book_editions(self,book_id):
+        identifiers=getattr(self.env,"CATALOG_IDENTIFIERS",None)
+        if not identifiers: return reply({"work_id":book_id,"editions":[]})
+        result=native(await identifiers.prepare("SELECT edition_id,payload_json FROM catalog_identifiers WHERE work_id=? GROUP BY edition_id ORDER BY edition_id LIMIT 100").bind(book_id).all())
+        rows=result.get("results",[]) if isinstance(result,dict) else []
+        editions=[]
+        for row in rows:
+            item=json.loads(row["payload_json"]); item["id"]=row["edition_id"]; editions.append(item)
+        return reply({"work_id":book_id,"editions":editions})
+
+    async def by_isbn(self,isbn):
+        normalized=re.sub(r"[^0-9X]","",isbn.upper())
+        if len(normalized) not in (10,13): return reply({"detail":"Invalid ISBN"},422)
+        if len(normalized)==10:
+            stem="978"+normalized[:9]; normalized=stem+str((10-sum((1 if index%2==0 else 3)*int(value) for index,value in enumerate(stem))%10)%10)
+        identifiers=getattr(self.env,"CATALOG_IDENTIFIERS",None)
+        if identifiers:
+            try:
+                result=native(await identifiers.prepare("SELECT payload_json FROM catalog_identifiers WHERE scheme='isbn' AND value=? LIMIT 10").bind(normalized).all()); rows=result.get("results",[]) if isinstance(result,dict) else []
+                matches=[]
+                for row in rows:
+                    item=json.loads(row["payload_json"]); matches.append({"id":item.get("work_id") or item.get("work_hint") or item.get("source_id"),"title":item.get("title","Untitled"),"author":next(iter(item.get("authors") or ["Unknown author"])),"year":int(match.group()) if (match:=re.search(r"(?:1[0-9]{3}|20[0-9]{2})",str(item.get("published") or ""))) else None,"cover_url":item.get("cover_url"),"subjects":item.get("subjects",[]),"source":"catalog","quality":"A","language":item.get("language"),"format":item.get("format")})
+                if matches: return reply({"book":matches[0],"matches":matches,"source":"catalog"})
+            except Exception as exc: print(f"Identifier lookup warning: {type(exc).__name__}: {exc}")
+        options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
+        result=await fetch(f"https://openlibrary.org/search.json?isbn={quote(normalized)}&limit=10&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn",options)
+        data=native(await result.json()); books=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
+        if not books: return reply({"detail":"ISBN not found"},404)
+        await self.cache_books(books); return reply({"book":books[0],"matches":books,"source":"openlibrary"})
 
     async def library(self,request):
         user=self.user(request)
