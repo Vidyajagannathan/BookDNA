@@ -4,7 +4,7 @@ from durable.user import UserDO
 from durable.catalog import CatalogShardDO
 from dna.mappings import map_subjects
 from security.tokens import create_token, verify_token
-from js import fetch, Object
+from js import fetch, Object, Request
 from pyodide.ffi import to_js as _to_js
 from urllib.parse import urlparse, parse_qs, quote, unquote
 import hashlib
@@ -56,16 +56,34 @@ class Default(WorkerEntrypoint):
         secure="; Secure" if getattr(self.env,"APP_ENV","development")=="production" else ""
         return f"bookdna_access={token}; Path=/; Max-Age=900; HttpOnly; SameSite=Lax{secure}"
 
+    def client_key(self,request):
+        return str(request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or "local").split(",")[0].strip()
+
+    def is_admin(self,request):
+        user=self.user(request); configured=str(getattr(self.env,"ADMIN_USER_IDS","")).split(",")
+        return bool(user and user.get("sub") in {value.strip() for value in configured if value.strip()})
+
     async def fetch(self,request):
         try:
             url=urlparse(request.url); path=url.path; method=request.method.upper()
-            if not path.startswith("/api/"): return await self.env.ASSETS.fetch(request)
+            if not path.startswith("/api/"):
+                app_routes={"/","/discover","/search","/dna","/login","/register","/account","/admin","/privacy","/terms"}
+                if "." in path.rsplit("/",1)[-1]: return await self.env.ASSETS.fetch(request)
+                shell_request=Request.new(f"{url.scheme}://{url.netloc}/index.html")
+                shell=await self.env.ASSETS.fetch(shell_request)
+                if path in app_routes or path.startswith("/library"): return shell
+                return Response(await shell.text(),status=404,headers=shell.headers)
             if method in ("POST","PUT","PATCH","DELETE") and not self.origin_ok(request): return reply({"detail":"Invalid request origin"},403)
             if path=="/api/health" and method=="GET": return reply({"status":"ok","service":"bookdna","build":"global-catalog-20260811"})
             if path=="/api/auth/register" and method=="POST": return await self.register(request)
             if path=="/api/auth/login" and method=="POST": return await self.login(request)
             if path=="/api/auth/logout" and method=="POST": return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
             if path=="/api/auth/me" and method=="GET": return await self.me(request)
+            if path=="/api/auth/profile" and method=="GET": return await self.profile(request)
+            if path=="/api/auth/profile" and method=="PUT": return await self.update_profile(request)
+            if path=="/api/auth/password" and method=="PUT": return await self.change_password(request)
+            if path=="/api/auth/account" and method=="DELETE": return await self.delete_account(request)
+            if path=="/api/admin/stats" and method=="GET": return await self.admin_stats(request)
             if path=="/api/books/search" and method=="GET": return await self.search(parse_qs(url.query))
             if path=="/api/books/catalog/status" and method=="GET": return await self.catalog_status()
             if path.startswith("/api/books/isbn/") and method=="GET": return await self.by_isbn(unquote(path.removeprefix("/api/books/isbn/")))
@@ -74,11 +92,19 @@ class Default(WorkerEntrypoint):
                 {"id":"fantasy","name":"Fantasy","query":"subject:fantasy"},{"id":"science-fiction","name":"Science fiction","query":"subject:science fiction"},
                 {"id":"romance","name":"Romance","query":"subject:romance"},{"id":"mystery","name":"Mystery & thrillers","query":"subject:mystery"},
                 {"id":"history","name":"History","query":"subject:history"},{"id":"biography","name":"Biography & memoir","query":"subject:biography"},
-                {"id":"philosophy","name":"Philosophy","query":"subject:philosophy"},{"id":"classics","name":"Classics","query":"subject:classics"}
+                {"id":"philosophy","name":"Philosophy","query":"subject:philosophy"},{"id":"classics","name":"Classics","query":"subject:classics"},
+                {"id":"horror","name":"Horror","query":"subject:horror"},{"id":"crime","name":"Crime","query":"subject:crime"},
+                {"id":"adventure","name":"Adventure","query":"subject:adventure"},{"id":"historical-fiction","name":"Historical fiction","query":"subject:historical fiction"},
+                {"id":"young-adult","name":"Young adult","query":"subject:young adult"},{"id":"children","name":"Children's","query":"subject:children"},
+                {"id":"poetry","name":"Poetry","query":"subject:poetry"},{"id":"science","name":"Science","query":"subject:science"},
+                {"id":"psychology","name":"Psychology","query":"subject:psychology"},{"id":"travel","name":"Travel","query":"subject:travel"},
+                {"id":"art","name":"Art & design","query":"subject:art"},{"id":"humour","name":"Humour","query":"subject:humor"}
             ]})
             if path.startswith("/api/books/") and method=="GET": return await self.book_detail(unquote(path.removeprefix("/api/books/")))
             if path=="/api/library" and method=="GET": return await self.library(request)
+            if path.startswith("/api/library/") and method=="DELETE": return await self.remove_library_book(request,unquote(path.removeprefix("/api/library/")))
             if path.startswith("/api/library/") and method=="PUT": return await self.update_library(request,unquote(path.removeprefix("/api/library/")))
+            if path.startswith("/api/recommendations/") and method=="GET": return await self.recommendations(request,unquote(path.removeprefix("/api/recommendations/")))
             if path=="/api/dna/me" and method=="GET": return await self.dna(request)
             return reply({"detail":"Not found"},404)
         except Exception as exc:
@@ -92,13 +118,17 @@ class Default(WorkerEntrypoint):
     async def register(self,request):
         body=await self.body(request); username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip(); password=str(body.get("password",""))
         if len(username)<3 or len(username)>30 or not username.replace("_","").isalnum() or "@" not in email or len(password)<8: return reply({"detail":"Invalid registration details"},422)
-        identity=self.env.IDENTITY.getByName("primary"); user=native(await identity.register(username,email,password))
+        identity=self.env.IDENTITY.getByName("primary")
+        if not await identity.rate_limit(f"register:{self.client_key(request)}",5,3600): return reply({"detail":"Too many registration attempts. Please try again later."},429)
+        user=native(await identity.register(username,email,password))
         if user.get("error"): return reply({"detail":user["error"]},409)
         await self.env.USERS.getByName(user["id"]).initialize(user["id"],user["username"])
         return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
 
     async def login(self,request):
-        body=await self.body(request); user=native(await self.env.IDENTITY.getByName("primary").authenticate(str(body.get("identifier","")),str(body.get("password",""))))
+        body=await self.body(request); identity=self.env.IDENTITY.getByName("primary"); identifier=str(body.get("identifier","")).strip().casefold(); bucket=hashlib.sha256(identifier.encode()).hexdigest()[:20]
+        if not await identity.rate_limit(f"login:{self.client_key(request)}:{bucket}",10,900): return reply({"detail":"Too many login attempts. Please wait and try again."},429)
+        user=native(await identity.authenticate(identifier,str(body.get("password",""))))
         if user.get("error"): return reply({"detail":user["error"]},401)
         return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
 
@@ -106,6 +136,36 @@ class Default(WorkerEntrypoint):
         user=self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         username=await self.env.IDENTITY.getByName("primary").username_for(user["sub"]); return reply({"id":user["sub"],"username":username})
+
+    async def profile(self,request):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        return reply(native(await self.env.IDENTITY.getByName("primary").profile(user["sub"])))
+
+    async def update_profile(self,request):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").update_profile(user["sub"],body.get("display_name"),body.get("timezone"),body.get("date_format"),body.get("language"),body.get("avatar")))
+        return reply({"detail":result["error"]},422) if result.get("error") else reply(result)
+
+    async def change_password(self,request):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").change_password(user["sub"],str(body.get("current_password","")),str(body.get("new_password",""))))
+        if result.get("error"): return reply({"detail":result["error"]},422)
+        return reply(result,headers={"Set-Cookie":self.auth_cookie({"id":user["sub"]})})
+
+    async def delete_account(self,request):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").delete_account(user["sub"],str(body.get("password",""))))
+        if result.get("error"): return reply({"detail":result["error"]},403)
+        await self.env.USERS.getByName(user["sub"]).delete_account_data()
+        return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
+
+    async def admin_stats(self,request):
+        if not self.is_admin(request): return reply({"detail":"Not found"},404)
+        return reply(native(await self.env.IDENTITY.getByName("primary").admin_stats()))
 
     def book_from_openlibrary(self,item):
         key=str(item.get("key","")).split("/")[-1]
@@ -155,9 +215,8 @@ class Default(WorkerEntrypoint):
         shards=self.search_shards()
         if not shards: return []
         rows=[]
-        for start in range(0,len(shards),4):
-            results=await asyncio.gather(*(self.local_shard_search(database,query,limit,offset,language,year_from,year_to,format_name) for database in shards[start:start+4]))
-            for result in results: rows.extend(result)
+        results=await asyncio.gather(*(self.local_shard_search(database,query,limit,offset,language,year_from,year_to,format_name) for database in shards))
+        for result in results: rows.extend(result)
         rows.sort(key=lambda row:(float(row.get("rank",0)),{"A":0,"B":1,"C":2}.get(row.get("quality"),3),-int(row.get("edition_count") or 0)))
         return [self.local_book(row) for row in rows[:limit]]
 
@@ -179,11 +238,12 @@ class Default(WorkerEntrypoint):
             next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
             return reply({"books":visible_local,"page":page,"limit":limit,"total":None,"has_more":True,"cursor":next_cursor,"source":"catalog"})
         options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
-        result=await fetch(f"https://openlibrary.org/search.json?q={quote(query)}&page={page}&limit={limit}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn",options)
+        try: result=await asyncio.wait_for(fetch(f"https://openlibrary.org/search.json?q={quote(query)}&page={page}&limit={limit}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn",options),8)
+        except asyncio.TimeoutError: return reply({"detail":"The book catalog took too long to respond. Please try again."},504)
         if not result.ok: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
         data=native(await result.json()); remote=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
         seen={book["id"] for book in visible_local}; books=visible_local+[book for book in remote if book["id"] not in seen]; books=books[:limit]
-        await self.cache_books(books)
+        # Search results do not wait for optional cache writes; local catalog imports own persistence.
         total=int(data.get("numFound",0)); next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
         return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":page*limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary"})
 
@@ -253,12 +313,40 @@ class Default(WorkerEntrypoint):
     async def update_library(self,request,book_id):
         user=self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False))
-        if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)): return reply({"detail":"Invalid library update"},422)
-        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits))
+        body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False)); dnf_reason=body.get("dnf_reason")
+        if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)) or (dnf_reason is not None and (not isinstance(dnf_reason,str) or len(dnf_reason)>500)): return reply({"detail":"Invalid library update"},422)
+        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits,dnf_reason))
+        await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"book_saved")
         return reply(result)
+
+    async def remove_library_book(self,request,book_id):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        result=native(await self.env.USERS.getByName(user["sub"]).remove_book(book_id))
+        if result.get("error"): return reply({"detail":result["error"]},404)
+        await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"book_removed"); return reply(result)
+
+    async def recommendations(self,request,book_id):
+        user=self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        library=native(await self.env.USERS.getByName(user["sub"]).library()); source=next((book for book in library if book.get("id")==book_id),None)
+        if not source: return reply({"detail":"Book not found in your library"},404)
+        excluded={book["id"] for book in library}; subjects=[str(value) for value in source.get("subjects",[]) if len(str(value))<80][:4]; theme_query="subject:"+(subjects[0] if subjects else " ".join(map_subjects(source.get("subjects",[]))[0]["name"].split()) if map_subjects(source.get("subjects",[])) else source["title"])
+        async def find(query):
+            result=await self.search({"q":[query],"limit":["12"],"page":["1"]}); data=native(await result.json()); return data.get("books",[])
+        themed,author=await asyncio.gather(find(theme_query),find(f'author:{source.get("author","")}'))
+        def clean(items,kind):
+            output=[]
+            for book in items:
+                if book["id"] in excluded or book["id"]==book_id or any(existing["id"]==book["id"] for existing in output): continue
+                shared=[subject for subject in subjects if any(subject.casefold() in candidate.casefold() or candidate.casefold() in subject.casefold() for candidate in book.get("subjects",[]))][:3]
+                book["reason"]=(f"Shares themes and subjects: {', '.join(shared)}" if shared else "Related through the catalog’s subject metadata") if kind=="similar" else f"Another work by {source.get('author')}"
+                output.append(book)
+                if len(output)>=6: break
+            return output
+        return reply({"source":source,"similar":clean(themed,"similar"),"by_author":clean(author,"author"),"basis":"Recommendations use catalog subjects, themes, authorship, and your existing library—not invented plot or character analysis."})
 
     async def dna(self,request):
         user=self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        return reply(native(await self.env.USERS.getByName(user["sub"]).dna()))
+        result=native(await self.env.USERS.getByName(user["sub"]).dna()); await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"dna_generated"); return reply(result)

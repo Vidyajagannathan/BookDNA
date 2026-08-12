@@ -1,0 +1,9 @@
+import { useEffect,useRef } from 'react'
+import { Bookmark,X } from 'lucide-react'
+import type { Book } from '../types'
+
+export function BookDetailsDialog({book,onClose,onSave}:{book:Book;onClose:()=>void;onSave:()=>void}){
+  const dialog=useRef<HTMLDivElement>(null)
+  useEffect(()=>{const previous=document.activeElement as HTMLElement|null;dialog.current?.focus();return()=>previous?.focus()},[])
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={event=>event.target===event.currentTarget&&onClose()}><div ref={dialog} tabIndex={-1} className="book-details-dialog" role="dialog" aria-modal="true" aria-labelledby="book-details-title" onKeyDown={event=>event.key==='Escape'&&onClose()}><button className="dialog-close" onClick={onClose} aria-label="Close"><X/></button><div className="book-details-layout">{book.cover_url?<img src={book.cover_url} alt={`Cover of ${book.title}`}/>:<div className="cover-placeholder"><span>{book.title}</span></div>}<div><span className="eyebrow">Book details</span><h2 id="book-details-title">{book.title}</h2><p className="book-details-author">{book.author}</p><dl><div><dt>First published</dt><dd>{book.year||'Unknown'}</dd></div><div><dt>Catalog editions</dt><dd>{book.edition_count??'Unknown'}</dd></div>{book.isbn?.[0]&&<div><dt>ISBN</dt><dd>{book.isbn[0]}</dd></div>}</dl>{book.subjects?.length?<><h3>Catalog subjects</h3><div className="subject-list">{book.subjects.slice(0,10).map(subject=><span key={subject}>{subject}</span>)}</div></>:<p className="book-details-note">More catalog details are not available for this record yet.</p>}<button className="button primary" onClick={onSave}><Bookmark size={17}/> Save to library</button></div></div></div></div>
+}

@@ -5,7 +5,8 @@
     "dev": "npm --prefix frontend run dev",
     "build": "npm --prefix frontend run build",
     "check": "npm --prefix frontend run check",
-    "test": "python -m unittest discover -s tests -v",
+    "test": ".venv/bin/python -m unittest discover -s tests -v",
+    "setup:python": "python3.13 -m venv .venv && .venv/bin/pip install -e .",
     "worker:dev": "wrangler dev",
     "deploy": "npm run build && wrangler deploy"
   }

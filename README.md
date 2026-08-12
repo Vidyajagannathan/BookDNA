@@ -8,6 +8,7 @@ Prerequisites: Node 20+, Python 3.13+, and Wrangler.
 
 ```bash
 npm --prefix frontend install
+npm run setup:python
 npm run build
 wrangler dev
 ```
@@ -20,6 +21,10 @@ The Worker serves the API and the built SPA on the same origin. For frontend-onl
 npm run check
 npm test
 ```
+
+On macOS, if `python3.13` is missing, install it with `brew install python@3.13`. The project-local `.venv` keeps BookDNA's supported Python and catalog dependencies separate from the system Python.
+
+Set `ADMIN_USER_IDS` to a comma-separated list of BookDNA user IDs to grant access to the private `/admin` dashboard. Keep this value out of source control in production.
 
 ## Deploy
 
