@@ -90,7 +90,7 @@ class Default(WorkerEntrypoint):
             if path.startswith("/api/books/") and path.endswith("/editions") and method=="GET": return await self.book_editions(unquote(path.removeprefix("/api/books/").removesuffix("/editions")))
             if path=="/api/books/collections" and method=="GET": return reply({"collections":[
                 {"id":"fantasy","name":"Fantasy","query":"subject:fantasy"},{"id":"science-fiction","name":"Science fiction","query":"subject:science fiction"},
-                {"id":"romance","name":"Romance","query":"subject:romance"},{"id":"mystery","name":"Mystery & thrillers","query":"subject:mystery"},
+                {"id":"romance","name":"Romance","query":"subject_key:romance"},{"id":"mystery","name":"Mystery & thrillers","query":"subject:mystery"},
                 {"id":"history","name":"History","query":"subject:history"},{"id":"biography","name":"Biography & memoir","query":"subject:biography"},
                 {"id":"philosophy","name":"Philosophy","query":"subject:philosophy"},{"id":"classics","name":"Classics","query":"subject:classics"},
                 {"id":"horror","name":"Horror","query":"subject:horror"},{"id":"crime","name":"Crime","query":"subject:crime"},
@@ -232,6 +232,7 @@ class Default(WorkerEntrypoint):
 
     async def search(self,params):
         query=str(params.get("q",[""])[0]).strip(); page=max(1,min(100,int(params.get("page",["1"])[0] or 1))); limit=max(4,min(40,int(params.get("limit",["24"])[0] or 24))); sort_name=str(params.get("sort",["relevance"])[0])
+        if query.casefold()=="subject:romance": query="subject_key:romance"
         if sort_name not in ("relevance","popular","newest","oldest","title_asc","title_desc"): return reply({"detail":"Invalid sort option"},422)
         cursor=str(params.get("cursor",[""])[0]); offset=(page-1)*limit
         if cursor:
