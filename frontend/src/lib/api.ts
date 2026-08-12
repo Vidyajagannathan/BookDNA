@@ -20,7 +20,7 @@ export const api = {
   profile:()=>request<Profile>('/auth/profile'),
   updateProfile:(profile:Pick<Profile,'display_name'|'timezone'|'date_format'|'language'|'avatar'>)=>request<Profile>('/auth/profile',{method:'PUT',body:JSON.stringify(profile)}),
   changePassword:(current_password:string,new_password:string)=>request<{ok:boolean}>('/auth/password',{method:'PUT',body:JSON.stringify({current_password,new_password})}),
-  search: (q: string, page = 1, limit = 24, signal?:AbortSignal) => request<BookSearch>(`/books/search?q=${encodeURIComponent(q)}&page=${page}&limit=${limit}`, {signal}),
+  search: (q: string, page = 1, limit = 24, signal?:AbortSignal, sort='relevance') => request<BookSearch>(`/books/search?q=${encodeURIComponent(q)}&page=${page}&limit=${limit}&sort=${encodeURIComponent(sort)}`, {signal}),
   book: (bookId:string) => request<{book:Book;editions:unknown[]}>(`/books/${encodeURIComponent(bookId)}`),
   collections: () => request<{ collections: BookCollection[] }>('/books/collections'),
   library: () => request<{ books: Book[] }>('/library'),
