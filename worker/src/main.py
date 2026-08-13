@@ -213,7 +213,10 @@ class Default(WorkerEntrypoint):
         if year_to: clauses.append("CAST(substr(w.published,1,4) AS INTEGER)<=?"); values.append(year_to)
         if format_name: clauses.append("lower(w.format)=lower(?)"); values.append(format_name)
         orders={"relevance":"rank,CASE w.quality WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,w.edition_count DESC,w.id","popular":"w.edition_count DESC,lower(w.title),w.id","newest":"CASE WHEN w.published IS NULL OR w.published='' THEN 1 ELSE 0 END,CAST(substr(w.published,1,4) AS INTEGER) DESC,lower(w.title),w.id","oldest":"CASE WHEN w.published IS NULL OR w.published='' THEN 1 ELSE 0 END,CAST(substr(w.published,1,4) AS INTEGER),lower(w.title),w.id","title_asc":"lower(w.title),w.id","title_desc":"lower(w.title) DESC,w.id DESC"}
-        sql=f"SELECT w.*,bm25(search_works_fts) rank FROM search_works_fts JOIN search_works w ON w.id=search_works_fts.id WHERE {' AND '.join(clauses)} ORDER BY {orders[sort_name]} LIMIT ?"
+        # Keep the cross-shard response small. In particular, sources_json can be
+        # sizeable and is only needed on the book detail endpoint.
+        columns="w.id,w.title,w.author,w.language,w.published,w.format,w.quality,w.edition_count,w.cover_url"
+        sql=f"SELECT {columns},bm25(search_works_fts) rank FROM search_works_fts JOIN search_works w ON w.id=search_works_fts.id WHERE {' AND '.join(clauses)} ORDER BY {orders[sort_name]} LIMIT ?"
         values.append(limit); result=native(await database.prepare(sql).bind(*values).all())
         return result.get("results",[]) if isinstance(result,dict) else []
 
@@ -221,7 +224,7 @@ class Default(WorkerEntrypoint):
         cover=row.get("cover_url"); year=None
         if row.get("published"):
             match=re.search(r"(?:1[0-9]{3}|20[0-9]{2})",str(row["published"])); year=int(match.group()) if match else None
-        return {"id":row["id"],"title":row.get("title") or "Untitled","author":row.get("author") or "Unknown author","year":year,"cover_url":cover,"subjects":[],"edition_count":int(row.get("edition_count") or 0),"source":"catalog","quality":row.get("quality"),"language":row.get("language"),"format":row.get("format"),"sources":json.loads(row.get("sources_json") or "[]")}
+        return {"id":row["id"],"title":row.get("title") or "Untitled","author":row.get("author") or "Unknown author","year":year,"cover_url":cover,"subjects":[],"edition_count":int(row.get("edition_count") or 0),"source":"catalog","quality":row.get("quality"),"language":row.get("language"),"format":row.get("format")}
 
     async def local_search(self,query,limit,offset,language=None,year_from=None,year_to=None,format_name=None,sort_name="relevance"):
         shards=self.search_shards()
@@ -231,6 +234,26 @@ class Default(WorkerEntrypoint):
         for result in results: rows.extend(result)
         rows.sort(key=lambda row:self.sort_key(row,sort_name),reverse=sort_name=="title_desc")
         return [self.local_book(row) for row in rows[offset:offset+limit]]
+
+    async def openlibrary_search(self,query,limit,offset,sort_name):
+        options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
+        upstream_sort={"relevance":"","popular":"editions","newest":"new","oldest":"old","title_asc":"title","title_desc":"title"}[sort_name]
+        sort_part=f"&sort={quote(upstream_sort)}" if upstream_sort else ""
+        # ISBN arrays are not displayed in search results and add substantially to
+        # popular-title payloads. The ISBN endpoint remains available when needed.
+        fields="key,title,author_name,first_publish_year,cover_i,subject,edition_count"
+        base_url=f"https://openlibrary.org/search.json?q={quote(query)}&limit={limit}&fields={fields}{sort_part}"
+        result=await asyncio.wait_for(fetch(f"{base_url}&offset={offset}",options),6)
+        if not result.ok: raise RuntimeError("Open Library search unavailable")
+        data=native(await result.json()); total=int(data.get("numFound",0))
+        if sort_name=="title_desc" and total:
+            reverse_offset=max(0,total-offset-limit)
+            result=await asyncio.wait_for(fetch(f"{base_url}&offset={reverse_offset}",options),6)
+            if not result.ok: raise RuntimeError("Open Library search unavailable")
+            data=native(await result.json())
+        books=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
+        if sort_name=="title_desc": books.reverse()
+        return books,total
 
     async def search(self,params):
         query=str(params.get("q",[""])[0]).strip(); page=max(1,min(100,int(params.get("page",["1"])[0] or 1))); limit=max(4,min(40,int(params.get("limit",["24"])[0] or 24))); sort_name=str(params.get("sort",["relevance"])[0])
@@ -245,32 +268,30 @@ class Default(WorkerEntrypoint):
         language=str(params.get("language",[""])[0]).strip() or None; format_name=str(params.get("format",[""])[0]).strip() or None
         try: year_from=int(params.get("year_from",["0"])[0] or 0) or None; year_to=int(params.get("year_to",["0"])[0] or 0) or None
         except ValueError: return reply({"detail":"Invalid year filter"},422)
-        mode=await self.catalog_mode(); local=[]
-        try: local=await self.local_search(query,limit,offset,language,year_from,year_to,format_name,sort_name)
-        except Exception as exc: print(f"Local catalog search warning: {type(exc).__name__}: {exc}")
+        mode=await self.catalog_mode()
+        # Local D1 shards and the live fallback are independent. Run them together
+        # so hybrid/shadow searches pay the slower latency, rather than their sum.
+        local_task=asyncio.create_task(self.local_search(query,limit,offset,language,year_from,year_to,format_name,sort_name))
+        remote_task=asyncio.create_task(self.openlibrary_search(query,limit,offset,sort_name))
+        try: local=await local_task
+        except Exception as exc:
+            print(f"Local catalog search warning: {type(exc).__name__}: {exc}"); local=[]
         visible_local=local if mode in ("hybrid","local-first") else []
         if len(visible_local)>=limit:
+            remote_task.cancel()
             next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
-            return reply({"books":visible_local,"page":page,"limit":limit,"total":None,"has_more":True,"cursor":next_cursor,"source":"catalog"})
-        options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
-        upstream_sort={"relevance":"","popular":"editions","newest":"new","oldest":"old","title_asc":"title","title_desc":"title"}[sort_name]; sort_part=f"&sort={quote(upstream_sort)}" if upstream_sort else ""; remote_offset=offset
-        base_url=f"https://openlibrary.org/search.json?q={quote(query)}&limit={limit}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn{sort_part}"
-        try: result=await asyncio.wait_for(fetch(f"{base_url}&offset={remote_offset}",options),8)
-        except asyncio.TimeoutError: return reply({"detail":"The book catalog took too long to respond. Please try again."},504)
-        if not result.ok: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
-        data=native(await result.json()); total=int(data.get("numFound",0))
-        if sort_name=="title_desc" and total:
-            remote_offset=max(0,total-offset-limit)
-            try: result=await asyncio.wait_for(fetch(f"{base_url}&offset={remote_offset}",options),8)
-            except asyncio.TimeoutError: return reply({"detail":"The book catalog took too long to respond. Please try again."},504)
-            if not result.ok: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
-            data=native(await result.json())
-        remote=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
-        if sort_name=="title_desc": remote.reverse()
+            return reply({"books":visible_local,"page":page,"limit":limit,"total":None,"has_more":True,"cursor":next_cursor,"source":"catalog"},headers={"Cache-Control":"public, max-age=60, stale-while-revalidate=300"})
+        try: remote,total=await remote_task
+        except asyncio.TimeoutError:
+            if visible_local: remote=[]; total=offset+len(visible_local)
+            else: return reply({"detail":"The book catalog took too long to respond. Please try again."},504)
+        except Exception:
+            if visible_local: remote=[]; total=offset+len(visible_local)
+            else: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
         seen={book["id"] for book in visible_local}; books=visible_local+[book for book in remote if book["id"] not in seen]; books=books[:limit]
         # Search results do not wait for optional cache writes; local catalog imports own persistence.
         next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
-        return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":offset+limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary","sort":sort_name})
+        return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":offset+limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary","sort":sort_name},headers={"Cache-Control":"public, max-age=60, stale-while-revalidate=300"})
 
     async def booktok_search(self,query,sort_name,page,limit):
         requested=query.split(":",1)[1].replace("-"," ").casefold(); allowed={category.casefold():category for category in BOOKTOK_CATEGORIES}
