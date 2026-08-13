@@ -2,7 +2,7 @@ from workers import WorkerEntrypoint, Response
 from durable.identity import IdentityDO
 from durable.user import UserDO
 from durable.catalog import CatalogShardDO
-from dna.mappings import map_subjects
+from dna.mappings import classify_book
 from security.tokens import create_token, verify_token
 from booktok import WORKS as BOOKTOK_WORKS, CATEGORIES as BOOKTOK_CATEGORIES, SOURCES as BOOKTOK_SOURCES, UPDATED as BOOKTOK_UPDATED
 from js import fetch, Object, Request
@@ -408,7 +408,7 @@ class Default(WorkerEntrypoint):
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False)); dnf_reason=body.get("dnf_reason"); private_note=body.get("private_note")
         if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)) or (dnf_reason is not None and (not isinstance(dnf_reason,str) or len(dnf_reason)>500)) or (private_note is not None and (not isinstance(private_note,str) or len(private_note)>2000)): return reply({"detail":"Invalid library update"},422)
-        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits,dnf_reason,private_note))
+        classification=classify_book(book); traits=classification["traits"]; shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits,dnf_reason,private_note))
         await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"book_saved")
         return reply(result)
 
