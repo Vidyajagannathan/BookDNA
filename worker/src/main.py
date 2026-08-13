@@ -4,6 +4,7 @@ from durable.user import UserDO
 from durable.catalog import CatalogShardDO
 from dna.mappings import map_subjects
 from security.tokens import create_token, verify_token
+from booktok import WORKS as BOOKTOK_WORKS, CATEGORIES as BOOKTOK_CATEGORIES, SOURCES as BOOKTOK_SOURCES, UPDATED as BOOKTOK_UPDATED
 from js import fetch, Object, Request
 from pyodide.ffi import to_js as _to_js
 from urllib.parse import urlparse, parse_qs, quote, unquote
@@ -98,7 +99,8 @@ class Default(WorkerEntrypoint):
                 {"id":"young-adult","name":"Young adult","query":"subject:young adult"},{"id":"children","name":"Children's","query":"subject:children"},
                 {"id":"poetry","name":"Poetry","query":"subject:poetry"},{"id":"science","name":"Science","query":"subject:science"},
                 {"id":"psychology","name":"Psychology","query":"subject:psychology"},{"id":"travel","name":"Travel","query":"subject:travel"},
-                {"id":"art","name":"Art & design","query":"subject:art"},{"id":"humour","name":"Humour","query":"subject:humor"}
+                {"id":"art","name":"Art & design","query":"subject:art"},{"id":"humour","name":"Humour","query":"subject:humor"},
+                {"id":"booktok","name":"BookTok","query":"booktok:all"}
             ]})
             if path.startswith("/api/books/") and method=="GET": return await self.book_detail(unquote(path.removeprefix("/api/books/")))
             if path=="/api/library" and method=="GET": return await self.library(request)
@@ -233,7 +235,8 @@ class Default(WorkerEntrypoint):
     async def search(self,params):
         query=str(params.get("q",[""])[0]).strip(); page=max(1,min(100,int(params.get("page",["1"])[0] or 1))); limit=max(4,min(40,int(params.get("limit",["24"])[0] or 24))); sort_name=str(params.get("sort",["relevance"])[0])
         if query.casefold()=="subject:romance": query="subject_key:romance"
-        if sort_name not in ("relevance","popular","newest","oldest","title_asc","title_desc"): return reply({"detail":"Invalid sort option"},422)
+        if sort_name not in ("relevance","featured","popular","newest","oldest","title_asc","title_desc"): return reply({"detail":"Invalid sort option"},422)
+        if query.casefold().startswith("booktok:"): return await self.booktok_search(query,sort_name,page,limit)
         cursor=str(params.get("cursor",[""])[0]); offset=(page-1)*limit
         if cursor:
             try: offset=max(0,int(base64.urlsafe_b64decode(cursor+"===").decode()))
@@ -268,6 +271,28 @@ class Default(WorkerEntrypoint):
         # Search results do not wait for optional cache writes; local catalog imports own persistence.
         next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
         return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":offset+limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary","sort":sort_name})
+
+    async def booktok_search(self,query,sort_name,page,limit):
+        requested=query.split(":",1)[1].replace("-"," ").casefold(); allowed={category.casefold():category for category in BOOKTOK_CATEGORIES}
+        if requested not in allowed: return reply({"detail":"Unknown BookTok category"},422)
+        selected=[(work_id,category,index) for index,(work_id,category) in enumerate(BOOKTOK_WORKS) if requested=="all" or category.casefold()==requested]
+        if not selected: return reply({"books":[],"page":page,"limit":limit,"total":0,"has_more":False,"source":"booktok","sort":sort_name})
+        expression=" OR ".join(f"/works/{work_id}" for work_id,_,_ in selected); options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
+        try: result=await asyncio.wait_for(fetch(f"https://openlibrary.org/search.json?q={quote(f'key:({expression})')}&limit={len(selected)}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn",options),8)
+        except asyncio.TimeoutError: return reply({"detail":"The BookTok collection took too long to respond. Please try again."},504)
+        if not result.ok: return reply({"detail":"The BookTok collection is temporarily unavailable"},502)
+        data=native(await result.json()); metadata={work_id:(category,index) for work_id,category,index in selected}; books=[]
+        for item in data.get("docs",[]):
+            work_id=str(item.get("key","")).split("/")[-1]
+            if work_id not in metadata: continue
+            book=self.book_from_openlibrary(item); book["booktok_category"],book["featured_order"]=metadata[work_id]; books.append(book)
+        if sort_name in ("featured","relevance"): books.sort(key=lambda book:book["featured_order"])
+        elif sort_name=="popular": books.sort(key=lambda book:(-int(book.get("edition_count") or 0),book["title"].casefold(),book["id"]))
+        elif sort_name=="newest": books.sort(key=lambda book:(book.get("year") is None,-int(book.get("year") or 0),book["title"].casefold()))
+        elif sort_name=="oldest": books.sort(key=lambda book:(book.get("year") is None,int(book.get("year") or 9999),book["title"].casefold()))
+        else: books.sort(key=lambda book:(book["title"].casefold(),book["id"]),reverse=sort_name=="title_desc")
+        offset=(page-1)*limit; visible=books[offset:offset+limit]
+        return reply({"books":visible,"page":page,"limit":limit,"total":len(books),"has_more":offset+limit<len(books),"source":"booktok","sort":sort_name,"collection":{"updated":BOOKTOK_UPDATED,"sources":BOOKTOK_SOURCES,"categories":BOOKTOK_CATEGORIES,"description":"A dated editorial collection drawn from current BookTok reading lists and long-running community favourites."}})
 
     async def catalog_mode(self):
         database=getattr(self.env,"CATALOG_DB",None)
@@ -335,9 +360,9 @@ class Default(WorkerEntrypoint):
     async def update_library(self,request,book_id):
         user=self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False)); dnf_reason=body.get("dnf_reason")
-        if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)) or (dnf_reason is not None and (not isinstance(dnf_reason,str) or len(dnf_reason)>500)): return reply({"detail":"Invalid library update"},422)
-        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits,dnf_reason))
+        body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False)); dnf_reason=body.get("dnf_reason"); private_note=body.get("private_note")
+        if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)) or (dnf_reason is not None and (not isinstance(dnf_reason,str) or len(dnf_reason)>500)) or (private_note is not None and (not isinstance(private_note,str) or len(private_note)>2000)): return reply({"detail":"Invalid library update"},422)
+        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits,dnf_reason,private_note))
         await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"book_saved")
         return reply(result)
 

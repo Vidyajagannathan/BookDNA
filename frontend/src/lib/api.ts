@@ -24,7 +24,7 @@ export const api = {
   book: (bookId:string) => request<{book:Book;editions:unknown[]}>(`/books/${encodeURIComponent(bookId)}`),
   collections: () => request<{ collections: BookCollection[] }>('/books/collections'),
   library: () => request<{ books: Book[] }>('/library'),
-  updateBook: (book: Book, status: LibraryStatus, rating?: number, favourite = false, dnf_reason?:string) => request<Book>(`/library/${encodeURIComponent(book.id)}`, { method: 'PUT', body: JSON.stringify({ book, status, rating, favourite, dnf_reason }) }),
+  updateBook: (book: Book, status: LibraryStatus, rating?: number, favourite = false, dnf_reason?:string, private_note?:string) => request<Book>(`/library/${encodeURIComponent(book.id)}`, { method: 'PUT', body: JSON.stringify({ book, status, rating, favourite, dnf_reason, private_note }) }),
   removeBook:(bookId:string)=>request<{ok:boolean}>(`/library/${encodeURIComponent(bookId)}`,{method:'DELETE'}),
   dna: () => request<DnaProfile>('/dna/me'),
   recommendations:(bookId:string)=>request<{source:Book;similar:RecommendationBook[];by_author:RecommendationBook[];basis:string}>(`/recommendations/${encodeURIComponent(bookId)}`),

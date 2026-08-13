@@ -12,15 +12,17 @@ class UserDO(DurableObject):
         columns = {row.name for row in self.sql.exec("PRAGMA table_info(library_entries)")}
         if "dnf_reason" not in columns:
             self.sql.exec("ALTER TABLE library_entries ADD COLUMN dnf_reason TEXT")
+        if "private_note" not in columns:
+            self.sql.exec("ALTER TABLE library_entries ADD COLUMN private_note TEXT")
 
     async def initialize(self, user_id, username):
         self.sql.exec("INSERT OR IGNORE INTO profile VALUES(?,?,?)", user_id, username, int(time.time()))
         return True
 
     async def library(self):
-        return [dict(json.loads(row.book_json), status=row.status, rating=row.rating, favourite=bool(row.is_favourite), dnf_reason=row.dnf_reason) for row in self.sql.exec("SELECT * FROM library_entries ORDER BY updated_at DESC LIMIT 500")]
+        return [dict(json.loads(row.book_json), status=row.status, rating=row.rating, favourite=bool(row.is_favourite), dnf_reason=row.dnf_reason, private_note=row.private_note) for row in self.sql.exec("SELECT * FROM library_entries ORDER BY updated_at DESC LIMIT 500")]
 
-    async def upsert_book(self, book, status, rating, favourite, traits, dnf_reason=None):
+    async def upsert_book(self, book, status, rating, favourite, traits, dnf_reason=None, private_note=None):
         if status not in ("READ", "CURRENTLY_READING", "WANT_TO_READ", "DNF"):
             return {"error": "Invalid reading status"}
         prior = list(self.sql.exec("SELECT contribution_json,traits_json,status FROM library_entries WHERE book_id=?", book["id"]))
@@ -37,8 +39,9 @@ class UserDO(DurableObject):
             if status == "DNF":
                 self.sql.exec("INSERT INTO dna_negative_signals VALUES(?,?) ON CONFLICT(trait_id) DO UPDATE SET evidence=evidence+excluded.evidence", trait["id"], trait["weight"])
         reason = (str(dnf_reason).strip()[:500] or None) if status == "DNF" and dnf_reason else None
-        self.sql.exec("INSERT INTO library_entries(book_id,book_json,status,rating,is_favourite,traits_json,contribution_json,updated_at,dnf_reason) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET book_json=excluded.book_json,status=excluded.status,rating=excluded.rating,is_favourite=excluded.is_favourite,traits_json=excluded.traits_json,contribution_json=excluded.contribution_json,updated_at=excluded.updated_at,dnf_reason=excluded.dnf_reason", book["id"], json.dumps(book), status, rating, 1 if favourite else 0, json.dumps(traits), json.dumps(new), int(time.time()), reason)
-        return dict(book, status=status, rating=rating, favourite=favourite, dnf_reason=reason)
+        note=(str(private_note).strip()[:2000] or None) if private_note else None
+        self.sql.exec("INSERT INTO library_entries(book_id,book_json,status,rating,is_favourite,traits_json,contribution_json,updated_at,dnf_reason,private_note) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET book_json=excluded.book_json,status=excluded.status,rating=excluded.rating,is_favourite=excluded.is_favourite,traits_json=excluded.traits_json,contribution_json=excluded.contribution_json,updated_at=excluded.updated_at,dnf_reason=excluded.dnf_reason,private_note=excluded.private_note", book["id"], json.dumps(book), status, rating, 1 if favourite else 0, json.dumps(traits), json.dumps(new), int(time.time()), reason, note)
+        return dict(book, status=status, rating=rating, favourite=favourite, dnf_reason=reason, private_note=note)
 
     async def dna(self):
         rows = list(self.sql.exec("SELECT * FROM dna_scores WHERE evidence>0 ORDER BY evidence DESC"))
