@@ -1,5 +1,6 @@
 import secrets
 import time
+import hashlib
 from workers import DurableObject
 from security.tokens import hash_password, verify_password
 
@@ -52,6 +53,26 @@ class IdentityDO(DurableObject):
         self.sql.exec("UPDATE users SET last_login_at=?,last_activity_at=? WHERE id=?", now, now, rows[0].id)
         self.sql.exec("INSERT INTO product_events(user_id,event_type,created_at) VALUES(?,?,?)", rows[0].id, "login", now)
         return {"id": rows[0].id, "username": rows[0].username}
+
+    async def create_session(self,user_id,lifetime):
+        session_id=secrets.token_urlsafe(24); now=int(time.time())
+        self.sql.exec("DELETE FROM refresh_sessions WHERE expires_at<? OR revoked_at IS NOT NULL",now)
+        self.sql.exec("INSERT INTO refresh_sessions(id,user_id,token_hash,expires_at,revoked_at) VALUES(?,?,?,?,NULL)",session_id,user_id,hashlib.sha256(session_id.encode()).hexdigest(),now+int(lifetime))
+        return session_id
+
+    async def session_active(self,user_id,session_id):
+        if not session_id: return False
+        digest=hashlib.sha256(session_id.encode()).hexdigest()
+        return bool(list(self.sql.exec("SELECT id FROM refresh_sessions WHERE id=? AND user_id=? AND token_hash=? AND revoked_at IS NULL AND expires_at>?",session_id,user_id,digest,int(time.time()))))
+
+    async def renew_session(self,user_id,session_id,lifetime):
+        self.sql.exec("UPDATE refresh_sessions SET expires_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL AND expires_at>?",int(time.time())+int(lifetime),session_id,user_id,int(time.time())); return True
+
+    async def revoke_session(self,user_id,session_id):
+        self.sql.exec("UPDATE refresh_sessions SET revoked_at=? WHERE id=? AND user_id=?",int(time.time()),session_id,user_id); return True
+
+    async def revoke_all_sessions(self,user_id):
+        self.sql.exec("UPDATE refresh_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",int(time.time()),user_id); return True
 
     async def username_for(self, user_id):
         rows = list(self.sql.exec("SELECT username FROM users WHERE id=? AND account_status='ACTIVE'", user_id))

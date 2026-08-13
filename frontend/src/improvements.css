@@ -1,1 +1,181 @@
-.collection-scroll{position:relative}.collection-scroll:after{content:"";position:absolute;right:0;top:24px;bottom:5px;width:45px;pointer-events:none;background:linear-gradient(90deg,transparent,var(--background))}.collection-hint{display:none;color:var(--text-secondary);font-size:11px;text-align:right;margin:4px 0}.book-title-button{border:0;background:none;color:inherit;font:inherit;padding:0;text-align:left}.book-title-button:hover,.book-title-button:focus{text-decoration:underline;text-underline-offset:3px}.cover-wrap.viewable{cursor:pointer}.cover-wrap.viewable:focus{outline:3px solid var(--accent);outline-offset:3px}.dna-preview-note{color:var(--text-secondary);font-size:11px;line-height:1.5;margin:22px 0 0}.book-details-dialog{position:relative;background:var(--surface-raised);width:min(820px,100%);max-height:90vh;overflow:auto;border-radius:var(--radius-lg);padding:34px;box-shadow:var(--shadow)}.book-details-layout{display:grid;grid-template-columns:220px 1fr;gap:35px}.book-details-layout>img,.book-details-layout>.cover-placeholder{width:220px;aspect-ratio:2/3;object-fit:cover;border-radius:5px}.book-details-layout h2{font-size:42px;margin:12px 35px 5px 0}.book-details-author,.book-details-note{color:var(--text-secondary)}.book-details-layout dl{display:flex;flex-wrap:wrap;gap:18px;margin:25px 0}.book-details-layout dl div{border-left:2px solid var(--accent);padding-left:10px}.book-details-layout dt{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--text-secondary)}.book-details-layout dd{margin:3px 0 0}.book-details-layout h3{font:23px 'Libre Caslon Display'}.subject-list{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:25px}.subject-list span{font-size:10px;padding:6px 9px;border-radius:99px;background:var(--border)}.not-found{text-align:center;display:flex;flex-direction:column;align-items:center;justify-content:center}.not-found h1{margin:20px 0}.not-found h1 em{color:var(--accent);font-weight:400}.not-found>p{color:var(--text-secondary);font-size:17px}.not-found>div{display:flex;gap:10px;margin-top:25px}.empty>h1{font-size:33px;letter-spacing:-1px;margin:18px}@media(max-width:560px){.auth-card input{font-size:16px}.collection-hint{display:block}.book-details-dialog{padding:28px 20px}.book-details-layout{grid-template-columns:1fr}.book-details-layout>img,.book-details-layout>.cover-placeholder{width:140px}.book-details-layout h2{font-size:33px}.not-found>div{flex-direction:column}}
+.collection-scroll {
+  position: relative;
+}
+.collection-scroll:after {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: 24px;
+  bottom: 5px;
+  width: 45px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, var(--background));
+}
+.collection-hint {
+  display: none;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-align: right;
+  margin: 4px 0;
+}
+.book-title-button {
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+}
+.book-title-button:hover,
+.book-title-button:focus {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.cover-wrap.viewable {
+  cursor: pointer;
+}
+.cover-wrap.viewable:focus {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+.dna-preview-note {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 22px 0 0;
+}
+.book-details-dialog {
+  position: relative;
+  background: var(--surface-raised);
+  width: min(820px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  border-radius: var(--radius-lg);
+  padding: 34px;
+  box-shadow: var(--shadow);
+}
+.book-details-layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 35px;
+}
+.book-details-layout > img,
+.book-details-layout > .cover-placeholder {
+  width: 220px;
+  aspect-ratio: 2/3;
+  object-fit: cover;
+  border-radius: 5px;
+}
+.book-details-layout h2 {
+  font-size: 42px;
+  margin: 12px 35px 5px 0;
+}
+.book-details-author,
+.book-details-note {
+  color: var(--text-secondary);
+}
+.book-details-layout dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin: 25px 0;
+}
+.book-details-layout dl div {
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+}
+.book-details-layout dt {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+}
+.book-details-layout dd {
+  margin: 3px 0 0;
+}
+.book-details-layout h3 {
+  font: 23px "Libre Caslon Display";
+}
+.subject-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 25px;
+}
+.subject-list span {
+  font-size: 10px;
+  padding: 6px 9px;
+  border-radius: 99px;
+  background: var(--border);
+}
+.not-found {
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.not-found h1 {
+  margin: 20px 0;
+}
+.not-found h1 em {
+  color: var(--accent);
+  font-weight: 400;
+}
+.not-found > p {
+  color: var(--text-secondary);
+  font-size: 17px;
+}
+.not-found > div {
+  display: flex;
+  gap: 10px;
+  margin-top: 25px;
+}
+.empty > h1 {
+  font-size: 33px;
+  letter-spacing: -1px;
+  margin: 18px;
+}
+@media (max-width: 560px) {
+  .auth-card input {
+    font-size: 16px;
+  }
+  .collection-hint {
+    display: block;
+  }
+  .book-details-dialog {
+    padding: 28px 20px;
+  }
+  .book-details-layout {
+    grid-template-columns: 1fr;
+  }
+  .book-details-layout > img,
+  .book-details-layout > .cover-placeholder {
+    width: 140px;
+  }
+  .book-details-layout h2 {
+    font-size: 33px;
+  }
+  .not-found > div {
+    flex-direction: column;
+  }
+}
+.stay-signed-in {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+}
+.auth-card .stay-signed-in input {
+  width: auto;
+  margin: 2px 0 0;
+}
+.stay-signed-in span {
+  font-size: 13px;
+}
+.stay-signed-in small {
+  display: block;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}

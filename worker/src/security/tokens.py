@@ -21,8 +21,8 @@ def verify_password(password: str, encoded: str) -> bool:
     except (ValueError, TypeError):
         return False
 
-def create_token(user_id: str, session_id: str, secret: str, lifetime: int = 900) -> str:
-    now = int(time.time()); header = _b64(json.dumps({"alg":"HS256","typ":"JWT"}, separators=(",", ":")).encode()); payload = _b64(json.dumps({"sub":user_id,"sid":session_id,"iat":now,"exp":now+lifetime}, separators=(",", ":")).encode()); signature = _b64(hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()); return f"{header}.{payload}.{signature}"
+def create_token(user_id: str, session_id: str, secret: str, lifetime: int = 900, remember: bool = False) -> str:
+    now = int(time.time()); header = _b64(json.dumps({"alg":"HS256","typ":"JWT"}, separators=(",", ":")).encode()); payload = _b64(json.dumps({"sub":user_id,"sid":session_id,"iat":now,"exp":now+lifetime,"rem":remember}, separators=(",", ":")).encode()); signature = _b64(hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()); return f"{header}.{payload}.{signature}"
 
 def verify_token(token: str, secret: str) -> dict | None:
     try:
@@ -32,4 +32,3 @@ def verify_token(token: str, secret: str) -> dict | None:
         return data if data.get("exp", 0) > time.time() else None
     except Exception:
         return None
-

@@ -42,8 +42,13 @@ class Default(WorkerEntrypoint):
         if not value and getattr(self.env,"APP_ENV","development")=="production": raise RuntimeError("Authentication is not configured")
         return str(value or "local-development-only-change-me")
 
-    def user(self,request):
+    def token_user(self,request):
         token=cookies(request).get("bookdna_access"); return verify_token(token,self.signing_secret()) if token else None
+
+    async def user(self,request):
+        user=self.token_user(request)
+        if not user or not await self.env.IDENTITY.getByName("primary").session_active(user.get("sub"),user.get("sid")): return None
+        return user
 
     def origin_ok(self,request):
         origin=request.headers.get("Origin"); host=request.headers.get("Host")
@@ -52,16 +57,17 @@ class Default(WorkerEntrypoint):
         parsed=urlparse(origin)
         return parsed.scheme=="https" and parsed.netloc==host
 
-    def auth_cookie(self,user):
-        token=create_token(user["id"],secrets.token_hex(12),self.signing_secret())
+    def auth_cookie(self,user,session_id,remember=True):
+        lifetime=30*86400 if remember else 12*3600; token=create_token(user["id"],session_id,self.signing_secret(),lifetime,remember)
         secure="; Secure" if getattr(self.env,"APP_ENV","development")=="production" else ""
-        return f"bookdna_access={token}; Path=/; Max-Age=900; HttpOnly; SameSite=Lax{secure}"
+        persistent=f"; Max-Age={lifetime}" if remember else ""
+        return f"bookdna_access={token}; Path=/; HttpOnly; SameSite=Lax{secure}{persistent}"
 
     def client_key(self,request):
         return str(request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or "local").split(",")[0].strip()
 
-    def is_admin(self,request):
-        user=self.user(request); configured=str(getattr(self.env,"ADMIN_USER_IDS","")).split(",")
+    async def is_admin(self,request):
+        user=await self.user(request); configured=str(getattr(self.env,"ADMIN_USER_IDS","")).split(",")
         return bool(user and user.get("sub") in {value.strip() for value in configured if value.strip()})
 
     async def fetch(self,request):
@@ -78,7 +84,8 @@ class Default(WorkerEntrypoint):
             if path=="/api/health" and method=="GET": return reply({"status":"ok","service":"bookdna","build":"global-catalog-20260811"})
             if path=="/api/auth/register" and method=="POST": return await self.register(request)
             if path=="/api/auth/login" and method=="POST": return await self.login(request)
-            if path=="/api/auth/logout" and method=="POST": return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
+            if path=="/api/auth/logout" and method=="POST": return await self.logout(request)
+            if path=="/api/auth/logout-all" and method=="POST": return await self.logout_all(request)
             if path=="/api/auth/me" and method=="GET": return await self.me(request)
             if path=="/api/auth/profile" and method=="GET": return await self.profile(request)
             if path=="/api/auth/profile" and method=="PUT": return await self.update_profile(request)
@@ -118,47 +125,65 @@ class Default(WorkerEntrypoint):
         return native(await request.json())
 
     async def register(self,request):
-        body=await self.body(request); username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip(); password=str(body.get("password",""))
+        body=await self.body(request); username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip(); password=str(body.get("password","")); remember=body.get("remember",True) is not False
         if len(username)<3 or len(username)>30 or not username.replace("_","").isalnum() or "@" not in email or len(password)<8: return reply({"detail":"Invalid registration details"},422)
         identity=self.env.IDENTITY.getByName("primary")
         if not await identity.rate_limit(f"register:{self.client_key(request)}",5,3600): return reply({"detail":"Too many registration attempts. Please try again later."},429)
         user=native(await identity.register(username,email,password))
         if user.get("error"): return reply({"detail":user["error"]},409)
         await self.env.USERS.getByName(user["id"]).initialize(user["id"],user["username"])
-        return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
+        session_id=await identity.create_session(user["id"],30*86400 if remember else 12*3600)
+        return reply(user,headers={"Set-Cookie":self.auth_cookie(user,session_id,remember)})
 
     async def login(self,request):
-        body=await self.body(request); identity=self.env.IDENTITY.getByName("primary"); identifier=str(body.get("identifier","")).strip().casefold(); bucket=hashlib.sha256(identifier.encode()).hexdigest()[:20]
+        body=await self.body(request); identity=self.env.IDENTITY.getByName("primary"); identifier=str(body.get("identifier","")).strip().casefold(); bucket=hashlib.sha256(identifier.encode()).hexdigest()[:20]; remember=body.get("remember",True) is not False
         if not await identity.rate_limit(f"login:{self.client_key(request)}:{bucket}",10,900): return reply({"detail":"Too many login attempts. Please wait and try again."},429)
         user=native(await identity.authenticate(identifier,str(body.get("password",""))))
         if user.get("error"): return reply({"detail":user["error"]},401)
-        return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
+        session_id=await identity.create_session(user["id"],30*86400 if remember else 12*3600)
+        return reply(user,headers={"Set-Cookie":self.auth_cookie(user,session_id,remember)})
+
+    async def logout(self,request):
+        user=self.token_user(request)
+        if user: await self.env.IDENTITY.getByName("primary").revoke_session(user.get("sub"),user.get("sid"))
+        return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
+
+    async def logout_all(self,request):
+        user=await self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        await self.env.IDENTITY.getByName("primary").revoke_all_sessions(user["sub"])
+        return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
 
     async def me(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        username=await self.env.IDENTITY.getByName("primary").username_for(user["sub"]); return reply({"id":user["sub"],"username":username})
+        username=await self.env.IDENTITY.getByName("primary").username_for(user["sub"])
+        if not username: return reply({"detail":"Sign in required"},401)
+        lifetime=30*86400 if user.get("rem") else 12*3600
+        await self.env.IDENTITY.getByName("primary").renew_session(user["sub"],user["sid"],lifetime)
+        return reply({"id":user["sub"],"username":username},headers={"Set-Cookie":self.auth_cookie({"id":user["sub"]},user["sid"],bool(user.get("rem")))})
 
     async def profile(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         return reply(native(await self.env.IDENTITY.getByName("primary").profile(user["sub"])))
 
     async def update_profile(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").update_profile(user["sub"],body.get("display_name"),body.get("timezone"),body.get("date_format"),body.get("language"),body.get("avatar")))
         return reply({"detail":result["error"]},422) if result.get("error") else reply(result)
 
     async def change_password(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").change_password(user["sub"],str(body.get("current_password","")),str(body.get("new_password",""))))
         if result.get("error"): return reply({"detail":result["error"]},422)
-        return reply(result,headers={"Set-Cookie":self.auth_cookie({"id":user["sub"]})})
+        session_id=await self.env.IDENTITY.getByName("primary").create_session(user["sub"],30*86400)
+        return reply(result,headers={"Set-Cookie":self.auth_cookie({"id":user["sub"]},session_id,True)})
 
     async def delete_account(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").delete_account(user["sub"],str(body.get("password",""))))
         if result.get("error"): return reply({"detail":result["error"]},403)
@@ -166,7 +191,7 @@ class Default(WorkerEntrypoint):
         return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
 
     async def admin_stats(self,request):
-        if not self.is_admin(request): return reply({"detail":"Not found"},404)
+        if not await self.is_admin(request): return reply({"detail":"Not found"},404)
         return reply(native(await self.env.IDENTITY.getByName("primary").admin_stats()))
 
     def book_from_openlibrary(self,item):
@@ -374,12 +399,12 @@ class Default(WorkerEntrypoint):
         await self.cache_books(books); return reply({"book":books[0],"matches":books,"source":"openlibrary"})
 
     async def library(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         return reply({"books":native(await self.env.USERS.getByName(user["sub"]).library())})
 
     async def update_library(self,request,book_id):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False)); dnf_reason=body.get("dnf_reason"); private_note=body.get("private_note")
         if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)) or (dnf_reason is not None and (not isinstance(dnf_reason,str) or len(dnf_reason)>500)) or (private_note is not None and (not isinstance(private_note,str) or len(private_note)>2000)): return reply({"detail":"Invalid library update"},422)
@@ -388,14 +413,14 @@ class Default(WorkerEntrypoint):
         return reply(result)
 
     async def remove_library_book(self,request,book_id):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         result=native(await self.env.USERS.getByName(user["sub"]).remove_book(book_id))
         if result.get("error"): return reply({"detail":result["error"]},404)
         await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"book_removed"); return reply(result)
 
     async def recommendations(self,request,book_id):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         library=native(await self.env.USERS.getByName(user["sub"]).library()); source=next((book for book in library if book.get("id")==book_id),None)
         if not source: return reply({"detail":"Book not found in your library"},404)
@@ -415,6 +440,6 @@ class Default(WorkerEntrypoint):
         return reply({"source":source,"similar":clean(themed,"similar"),"by_author":clean(author,"author"),"basis":"Recommendations use catalog subjects, themes, authorship, and your existing library—not invented plot or character analysis."})
 
     async def dna(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         result=native(await self.env.USERS.getByName(user["sub"]).dna()); await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"dna_generated"); return reply(result)
