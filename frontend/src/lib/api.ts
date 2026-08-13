@@ -20,11 +20,21 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...init?.headers },
-    ...init,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`/api${path}`, {
+      credentials: "include",
+      headers: { "Content-Type": "application/json", ...init?.headers },
+      ...init,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError")
+      throw new ApiError(
+        "The request took too long. Your draft is safe—please try again.",
+        408,
+      );
+    throw error;
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new ApiError(body.detail || "Something went wrong", response.status);
@@ -109,6 +119,7 @@ export const api = {
         dnf_reason,
         private_note,
       }),
+      signal: AbortSignal.timeout(15_000),
     }),
   removeBook: (bookId: string) =>
     request<{ ok: boolean }>(`/library/${encodeURIComponent(bookId)}`, {

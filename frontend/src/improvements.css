@@ -179,3 +179,14 @@
   color: var(--text-secondary);
   margin-top: 4px;
 }
+.draft-restored{padding:9px 11px;border-radius:8px;background:#d7a83b20;color:var(--text-secondary)!important;font-size:12px}.dialog-actions{position:sticky;bottom:-34px;margin:18px -34px -34px;padding:14px 34px calc(14px + env(safe-area-inset-bottom));background:var(--surface-raised);border-top:1px solid var(--border);z-index:2}.dialog-actions>.button{width:100%;min-height:48px}.dialog-actions .error{margin:0 0 10px}.save-toast{position:fixed;right:20px;bottom:20px;z-index:80;padding:14px 18px;border-radius:10px;background:var(--forest);color:white;box-shadow:var(--shadow);font-size:13px}
+@media (max-width: 700px){
+  .topbar nav{height:calc(64px + env(safe-area-inset-bottom));padding-bottom:env(safe-area-inset-bottom)}
+  .app-shell{padding-bottom:calc(64px + env(safe-area-inset-bottom))}
+  .icon-button,.profile-button,.cover-wrap>button,.filter-tabs button,.collection-tabs button{min-width:44px;min-height:44px}
+  .page-heading h1{font-size:clamp(38px,12vw,52px);line-height:1.02}.page-heading{margin-bottom:30px}.page-heading.row{align-items:center}.big-count{font-size:44px}
+  .dialog-backdrop{padding:0;align-items:end}.reading-dialog{width:100%;max-height:calc(100dvh - env(safe-area-inset-top));border-radius:22px 22px 0 0;padding:26px 20px calc(20px + env(safe-area-inset-bottom));scroll-padding-bottom:100px}.reading-dialog h2{font-size:28px}.dialog-actions{bottom:calc(-20px - env(safe-area-inset-bottom));margin:18px -20px calc(-20px - env(safe-area-inset-bottom));padding:12px 20px calc(12px + env(safe-area-inset-bottom))}
+  .status-options button,.favourite-toggle{min-height:44px}.reading-dialog textarea{font-size:16px}.save-toast{left:12px;right:12px;bottom:calc(76px + env(safe-area-inset-bottom));text-align:center}
+  .auth-intro{min-height:auto;padding:42px 25px 32px}.auth-intro h1{font-size:42px;margin:14px 0}.auth-intro p{margin-bottom:0}.auth-card{padding:38px 25px}.auth-card h2{margin-bottom:25px}
+}
+@media (max-width: 380px){.book-grid{grid-template-columns:1fr}.book-card{max-width:280px;width:100%;margin-inline:auto}.searchbar{padding-left:14px}.searchbar input{min-width:0;padding-inline:10px}}
