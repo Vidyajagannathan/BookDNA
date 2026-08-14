@@ -83,6 +83,10 @@ class IdentityDO(DurableObject):
         if not rows: return {"error":"Account not found"}
         row=rows[0]; return {key:getattr(row,key) for key in ("id","username","email","display_name","timezone","date_format","language","avatar")}
 
+    async def user_id_for_email(self,email):
+        rows=list(self.sql.exec("SELECT id FROM users WHERE email_normalized=? AND account_status='ACTIVE' LIMIT 1",str(email).strip().casefold()))
+        return rows[0].id if rows else None
+
     async def update_profile(self,user_id,display_name,timezone,date_format,language,avatar):
         if language!="en" or date_format not in ("DD/MM/YYYY","MM/DD/YYYY","YYYY-MM-DD") or avatar not in ("forest","clay","gold","ocean","plum"): return {"error":"Invalid profile settings"}
         name=str(display_name or "").strip()[:60] or None; zone=str(timezone or "UTC").strip()[:64]
@@ -118,6 +122,6 @@ class IdentityDO(DurableObject):
         month = now - 30 * 86400
         def scalar(sql, *args):
             return list(self.sql.exec(sql, *args))[0].count
-        totals = {"registrations": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE'"), "logins": scalar("SELECT count(*) count FROM product_events WHERE event_type='login'"), "active_24h": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE' AND last_activity_at>=?", day), "active_30d": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE' AND last_activity_at>=?", month), "books_saved": scalar("SELECT count(*) count FROM product_events WHERE event_type='book_saved'"), "dna_generated": scalar("SELECT count(*) count FROM product_events WHERE event_type='dna_generated'")}
+        totals = {"registrations": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE'"), "logins": scalar("SELECT count(*) count FROM product_events WHERE event_type='login'"), "active_24h": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE' AND last_activity_at>=?", day), "active_30d": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE' AND last_activity_at>=?", month), "books_saved": scalar("SELECT count(*) count FROM product_events WHERE event_type='book_saved'"), "dna_generated": scalar("SELECT count(*) count FROM product_events WHERE event_type='dna_generated'"), "dna_failed": scalar("SELECT count(*) count FROM product_events WHERE event_type='dna_failed'")}
         daily = [{"day": row.day, "registrations": row.registrations, "logins": row.logins, "books_saved": row.books_saved, "dna_generated": row.dna_generated} for row in self.sql.exec("SELECT date(created_at,'unixepoch') day,sum(event_type='registration') registrations,sum(event_type='login') logins,sum(event_type='book_saved') books_saved,sum(event_type='dna_generated') dna_generated FROM product_events WHERE created_at>=? GROUP BY day ORDER BY day DESC LIMIT 14", month)]
         return {"totals": totals, "daily": daily}

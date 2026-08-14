@@ -67,8 +67,14 @@ class Default(WorkerEntrypoint):
         return str(request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or "local").split(",")[0].strip()
 
     async def is_admin(self,request):
-        user=await self.user(request); configured=str(getattr(self.env,"ADMIN_USER_IDS","")).split(",")
-        return bool(user and user.get("sub") in {value.strip() for value in configured if value.strip()})
+        user=await self.user(request)
+        if not user: return False
+        configured_ids={value.strip() for value in str(getattr(self.env,"ADMIN_USER_IDS","")).split(",") if value.strip()}
+        if user.get("sub") in configured_ids: return True
+        configured_emails={value.strip().casefold() for value in str(getattr(self.env,"ADMIN_EMAILS","")).split(",") if value.strip()}
+        if not configured_emails: return False
+        profile=native(await self.env.IDENTITY.getByName("primary").profile(user["sub"]))
+        return str(profile.get("email","")).casefold() in configured_emails
 
     async def fetch(self,request):
         try:
@@ -92,6 +98,7 @@ class Default(WorkerEntrypoint):
             if path=="/api/auth/password" and method=="PUT": return await self.change_password(request)
             if path=="/api/auth/account" and method=="DELETE": return await self.delete_account(request)
             if path=="/api/admin/stats" and method=="GET": return await self.admin_stats(request)
+            if path=="/api/admin/dna-diagnostic" and method=="GET": return await self.admin_dna_diagnostic(request,parse_qs(url.query))
             if path=="/api/books/search" and method=="GET": return await self.search(parse_qs(url.query))
             if path=="/api/books/catalog/status" and method=="GET": return await self.catalog_status()
             if path.startswith("/api/books/isbn/") and method=="GET": return await self.by_isbn(unquote(path.removeprefix("/api/books/isbn/")))
@@ -442,4 +449,18 @@ class Default(WorkerEntrypoint):
     async def dna(self,request):
         user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        result=native(await self.env.USERS.getByName(user["sub"]).dna()); await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"dna_generated"); return reply(result)
+        try:
+            result=native(await self.env.USERS.getByName(user["sub"]).dna())
+        except Exception:
+            await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"dna_failed")
+            raise
+        await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"dna_generated"); return reply(result)
+
+    async def admin_dna_diagnostic(self,request,query):
+        if not await self.is_admin(request): return reply({"detail":"Administrator access required"},403)
+        email=str((query.get("email") or [""])[0]).strip().casefold()
+        if "@" not in email: return reply({"detail":"Enter a valid account email"},422)
+        identity=self.env.IDENTITY.getByName("primary"); user_id=await identity.user_id_for_email(email)
+        if not user_id: return reply({"detail":"Active account not found"},404)
+        diagnostic=native(await self.env.USERS.getByName(user_id).dna_diagnostic())
+        return reply({"email":email,"user_id":user_id,**diagnostic})

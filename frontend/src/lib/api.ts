@@ -8,6 +8,7 @@ import type {
   Profile,
   RecommendationBook,
   User,
+  DnaDiagnostic,
 } from "../types";
 
 export class ApiError extends Error {
@@ -134,4 +135,5 @@ export const api = {
       basis: string;
     }>(`/recommendations/${encodeURIComponent(bookId)}`),
   adminStats: () => request<AdminStats>("/admin/stats"),
+  dnaDiagnostic: (email:string) => request<DnaDiagnostic>(`/admin/dna-diagnostic?email=${encodeURIComponent(email)}`),
 };

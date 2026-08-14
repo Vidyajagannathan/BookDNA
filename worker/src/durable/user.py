@@ -2,7 +2,7 @@ import json
 import time
 from workers import DurableObject
 from dna.scoring import Signal, contribution, calibrated_display_score
-from dna.mappings import classify_book
+from dna.mappings import classify_book, plan_library_classifications
 
 
 class UserDO(DurableObject):
@@ -45,7 +45,7 @@ class UserDO(DurableObject):
         return dict(book, status=status, rating=rating, favourite=favourite, dnf_reason=reason, private_note=note)
 
     async def dna(self):
-        self._rebuild_dna()
+        plans=self._rebuild_dna()
         rows = list(self.sql.exec("SELECT * FROM dna_scores WHERE evidence>0 ORDER BY evidence DESC"))
         total = sum(row.evidence for row in rows)
         entries=list(self.sql.exec("SELECT book_id,book_json,status,rating,is_favourite,traits_json,contribution_json FROM library_entries")); shaping=[entry for entry in entries if json.loads(entry.contribution_json)]
@@ -63,27 +63,37 @@ class UserDO(DurableObject):
         label="Established" if profile_confidence>=75 else "Developing" if profile_confidence>=40 else "Early"
         classifications=[]
         for entry in completed_entries:
-            book=json.loads(entry.book_json); classification=classify_book(book); included=bool(json.loads(entry.contribution_json))
-            classifications.append({"id":book["id"],"title":book.get("title","Untitled"),"author":book.get("author"),"included":included,"state":"included" if included else "needs_classification","reason":self._classification_reason(classification,included),"reading_type":classification["reading_type"],"classification_source":classification["source"],"traits":[trait["name"] for trait in classification["traits"]]})
+            book=json.loads(entry.book_json); plan=plans[entry.book_id]; classification=plan["classification"]; included=bool(json.loads(entry.contribution_json))
+            classifications.append({"id":book["id"],"title":book.get("title","Untitled"),"author":book.get("author"),"included":included,"state":plan["state"],"reason":self._classification_reason(classification,plan),"reading_type":classification["reading_type"],"classification_source":classification["source"],"traits":[trait["name"] for trait in classification["traits"]],"format_type":classification["format_type"],"series_name":classification["series_name"],"contained_titles":classification["matched_titles"],"counted_titles":plan["counted_titles"],"duplicate_titles":plan["duplicate_titles"]})
         classifications.sort(key=lambda item:(not item["included"],item["title"].casefold()))
-        return {"evidence":round(total,1),"profile_confidence":profile_confidence,"confidence_label":label,"books_shaping":len(shaping),"completed_books":completed,"total_books":total_books,"completion_rate":round(100*completed/total_books) if total_books else 0,"active_traits":len(rows),"active_categories":categories,"completed_classifications":classifications,"traits":traits}
+        unclassified=sum(item["state"]=="needs_classification" for item in classifications)
+        return {"classifier_version":"2026.08.14","evidence":round(total,1),"profile_confidence":profile_confidence,"confidence_label":label,"books_shaping":len(shaping),"completed_books":completed,"total_books":total_books,"completion_rate":round(100*completed/total_books) if total_books else 0,"active_traits":len(rows),"active_categories":categories,"unclassified_books":unclassified,"completed_classifications":classifications,"traits":traits}
 
-    def _classification_reason(self,classification,included):
-        if not included: return "No recognised catalogue subjects or reliable title match yet."
+    async def dna_diagnostic(self):
+        profile=await self.dna()
+        return {"profile":profile,"coverage_percent":round(100*(profile["completed_books"]-profile["unclassified_books"])/profile["completed_books"]) if profile["completed_books"] else 0}
+
+    def _classification_reason(self,classification,plan):
+        if plan["state"]=="duplicate_excluded": return "Excluded from DNA because all titles in this collection are already represented by individual Library entries."
+        if plan["state"]=="partial_collection": return "Partially included; overlapping individual books were removed from this collection's DNA evidence."
+        if not classification["traits"]: return "No recognised catalogue subjects or reliable title match yet."
+        if classification["source"]=="verified_series": return "Included using verified author and series information."
         if classification["source"]=="title_author_fallback": return "Included using a conservative title and author match."
         return "Included using catalogue subjects."
 
     def _rebuild_dna(self):
         """Reclassify existing entries so mapping improvements apply without re-saving books."""
-        entries=list(self.sql.exec("SELECT book_id,book_json,status,rating,is_favourite FROM library_entries"))
+        entries=list(self.sql.exec("SELECT book_id,book_json,status,rating,is_favourite FROM library_entries")); records=[(entry,json.loads(entry.book_json)) for entry in entries]
+        plans=plan_library_classifications([{"book_id":entry.book_id,"book":book,"status":entry.status} for entry,book in records])
         self.sql.exec("DELETE FROM dna_scores; DELETE FROM dna_negative_signals;")
-        for entry in entries:
-            book=json.loads(entry.book_json); traits=classify_book(book)["traits"]; weights={trait["id"]:trait["weight"] for trait in traits}; new=contribution(Signal(entry.status,entry.rating,bool(entry.is_favourite)),weights)
-            self.sql.exec("UPDATE library_entries SET traits_json=?,contribution_json=? WHERE book_id=?",json.dumps(traits),json.dumps(new),entry.book_id)
-            for trait in traits:
+        for entry,book in records:
+            plan=plans[entry.book_id]; classification=plan["classification"]; weights={trait["id"]:trait["weight"]*plan["coverage"] for trait in classification["traits"]}; new=contribution(Signal(entry.status,entry.rating,bool(entry.is_favourite)),weights)
+            self.sql.exec("UPDATE library_entries SET traits_json=?,contribution_json=? WHERE book_id=?",json.dumps(classification["traits"]),json.dumps(new),entry.book_id)
+            for trait in classification["traits"]:
                 value=new.get(trait["id"],0)
                 if value>0: self.sql.exec("INSERT INTO dna_scores(trait_id,name,category,evidence) VALUES(?,?,?,?) ON CONFLICT(trait_id) DO UPDATE SET evidence=evidence+excluded.evidence",trait["id"],trait["name"],trait["category"],value)
                 if entry.status=="DNF": self.sql.exec("INSERT INTO dna_negative_signals VALUES(?,?) ON CONFLICT(trait_id) DO UPDATE SET evidence=evidence+excluded.evidence",trait["id"],trait["weight"])
+        return plans
 
     async def remove_book(self,book_id):
         prior=list(self.sql.exec("SELECT contribution_json,traits_json,status FROM library_entries WHERE book_id=?",book_id))
