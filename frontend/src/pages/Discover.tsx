@@ -10,8 +10,8 @@ import { LoaderCircle, Search, Sparkles } from "lucide-react";
 import { api, ApiError } from "../lib/api";
 import { BookCard } from "../components/BookCard";
 import { BookDetailsDialog } from "../components/BookDetailsDialog";
-import { ReadingDialog } from "../components/ReadingDialog";
-import { clearReadingDraft } from "../lib/readingDraft";
+import { QuickStatusDialog } from "../components/QuickStatusDialog";
+import { libraryStatusLabel } from "../lib/libraryStatus";
 import type { Book, LibraryStatus } from "../types";
 
 const pendingBookKey = "bookdna-pending-book";
@@ -50,10 +50,12 @@ export function Discover() {
   const [activeQuery, setActiveQuery] = useState(initialQuery);
   const [heading, setHeading] = useState(initialHeading);
   const [sort, setSort] = useState(initialSort);
-  const [editing, setEditing] = useState<Book>();
+  const [selectingStatus, setSelectingStatus] = useState<Book>();
   const [viewing, setViewing] = useState<Book>();
   const [saveError, setSaveError] = useState("");
-  const [saveNotice, setSaveNotice] = useState("");
+  const [saveNotice, setSaveNotice] = useState<
+    { book: Book; status: LibraryStatus } | undefined
+  >();
   const [slow, setSlow] = useState(false);
   const queryClient = useQueryClient();
   const isBookTok = activeQuery.startsWith("booktok:");
@@ -93,7 +95,7 @@ export function Discover() {
     try {
       const raw = sessionStorage.getItem(pendingBookKey);
       if (raw) {
-        setEditing(JSON.parse(raw) as Book);
+        setSelectingStatus(JSON.parse(raw) as Book);
         sessionStorage.removeItem(pendingBookKey);
       }
     } catch {
@@ -107,7 +109,7 @@ export function Discover() {
     setViewing(undefined);
     setSaveError("");
     if (session.data) {
-      setEditing(book);
+      setSelectingStatus(book);
       return;
     }
     sessionStorage.setItem(pendingBookKey, JSON.stringify(book));
@@ -118,26 +120,39 @@ export function Discover() {
   const save = useMutation({
     mutationFn: ({
       book,
-      values,
+      status,
     }: {
       book: Book;
-      values: [
-        LibraryStatus,
-        number | undefined,
-        boolean,
-        string | undefined,
-        string | undefined,
-      ];
+      status: LibraryStatus;
     }) =>
       queryClient
         .fetchQuery({ queryKey: ["auth", "me"], queryFn: api.me, staleTime: 0 })
-        .then(() => api.updateBook(book, ...values)),
-    onSuccess: (_saved, variables) => {
-      clearReadingDraft(variables.book.id);
-      setEditing(undefined);
+        .then(() =>
+          api.updateBook(
+            book,
+            status,
+            book.rating,
+            Boolean(book.favourite),
+            book.dnf_reason,
+            book.private_note,
+          ),
+        ),
+    onSuccess: (savedBook, variables) => {
+      queryClient.setQueryData<{ books: Book[] }>(["library"], (current) => {
+        if (!current) return { books: [savedBook] };
+        const exists = current.books.some((book) => book.id === savedBook.id);
+        return {
+          books: exists
+            ? current.books.map((book) =>
+                book.id === savedBook.id ? savedBook : book,
+              )
+            : [savedBook, ...current.books],
+        };
+      });
+      setSelectingStatus(undefined);
       setSaveError("");
-      setSaveNotice(`Saved “${variables.book.title}” to your library.`);
-      window.setTimeout(() => setSaveNotice(""), 4000);
+      setSaveNotice({ book: savedBook, status: variables.status });
+      window.setTimeout(() => setSaveNotice(undefined), 6000);
       sessionStorage.removeItem(pendingBookKey);
       void queryClient.invalidateQueries({ queryKey: ["library"] });
       void queryClient.invalidateQueries({ queryKey: ["dna"] });
@@ -145,7 +160,7 @@ export function Discover() {
     onError: (error, variables) => {
       if (error instanceof ApiError && error.status === 401) {
         sessionStorage.setItem(pendingBookKey, JSON.stringify(variables.book));
-        setEditing(undefined);
+        setSelectingStatus(undefined);
         const returnTo = new URLSearchParams(params);
         returnTo.set("save", "pending");
         navigate(`/login?next=${encodeURIComponent(`/discover?${returnTo}`)}`);
@@ -203,7 +218,17 @@ export function Discover() {
     <section className="page discover">
       {saveNotice && (
         <div className="save-toast" role="status">
-          {saveNotice}
+          <span>
+            Saved as {libraryStatusLabel(saveNotice.status)}.
+          </span>
+          <button
+            type="button"
+            onClick={() =>
+              navigate(`/library?edit=${encodeURIComponent(saveNotice.book.id)}`)
+            }
+          >
+            Edit details
+          </button>
         </div>
       )}
       <div className="page-heading">
@@ -392,27 +417,22 @@ export function Discover() {
           onSave={() => requireSession(viewing)}
         />
       )}{" "}
-      {editing && (
-        <ReadingDialog
-          book={saved.get(editing.id) || editing}
+      {selectingStatus && (
+        <QuickStatusDialog
+          book={saved.get(selectingStatus.id) || selectingStatus}
           pending={save.isPending}
+          pendingStatus={save.variables?.status}
           error={saveError}
           onClose={() => {
             if (!save.isPending) {
-              setEditing(undefined);
+              setSelectingStatus(undefined);
               setSaveError("");
             }
           }}
-          onSave={(values) =>
+          onSelect={(status) =>
             save.mutate({
-              book: editing,
-              values: [
-                values.status,
-                values.rating,
-                values.favourite,
-                values.dnf_reason,
-                values.private_note,
-              ],
+              book: saved.get(selectingStatus.id) || selectingStatus,
+              status,
             })
           }
         />

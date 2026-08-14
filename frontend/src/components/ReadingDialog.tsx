@@ -2,13 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { Heart, X } from "lucide-react";
 import type { Book, LibraryStatus } from "../types";
 import { readReadingDraft, writeReadingDraft } from "../lib/readingDraft";
-
-const statuses: [LibraryStatus, string][] = [
-  ["WANT_TO_READ", "Want to read"],
-  ["CURRENTLY_READING", "Reading"],
-  ["READ", "Read"],
-  ["DNF", "Did not finish"],
-];
+import { libraryStatuses } from "../lib/libraryStatus";
 type ReadingDraft = {
   status: LibraryStatus;
   rating: string;
@@ -153,7 +147,7 @@ export function ReadingDialog({
         <fieldset disabled={pending}>
           <legend>Reading status</legend>
           <div className="status-options">
-            {statuses.map(([value, label]) => (
+            {libraryStatuses.map(([value, label]) => (
               <button
                 type="button"
                 key={value}

@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BookOpen } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { BookCard } from "../components/BookCard";
 import { ReadingDialog } from "../components/ReadingDialog";
@@ -18,6 +18,7 @@ const filters: [LibraryStatus | "ALL", string][] = [
 ];
 
 export function LibraryPage() {
+  const [params, setParams] = useSearchParams();
   const [filter, setFilter] = useState<LibraryStatus | "ALL">("ALL");
   const [editing, setEditing] = useState<Book>();
   const [recommendations, setRecommendations] = useState<string>();
@@ -35,6 +36,16 @@ export function LibraryPage() {
     retry: false,
     enabled: Boolean(session.data),
   });
+  useEffect(() => {
+    const bookId = params.get("edit");
+    if (!bookId || !library.data) return;
+    const book = library.data.books.find((item) => item.id === bookId);
+    if (!book) return;
+    setEditing(book);
+    const next = new URLSearchParams(params);
+    next.delete("edit");
+    setParams(next, { replace: true });
+  }, [library.data, params, setParams]);
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["library"] });
     void queryClient.invalidateQueries({ queryKey: ["dna"] });
