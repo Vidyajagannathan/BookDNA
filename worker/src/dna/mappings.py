@@ -60,6 +60,8 @@ def _series_match(title: str, author: str, raw_title: str):
         matched=[candidate for candidate in rule["titles"] if candidate in title]
         if matched:
             collection_syntax="/" in raw_title or ";" in raw_title or any(marker in title for marker in ("box set","boxed set","collection","omnibus","bundle"))
+            if any(marker in title for marker in ("box set", "boxed set", "complete series")):
+                matched = list(rule["titles"])
             if not collection_syntax:
                 starts=[candidate for candidate in matched if title.startswith(candidate)]
                 matched=[max(starts,key=len)] if starts else [max(matched,key=len)]

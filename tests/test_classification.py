@@ -81,7 +81,12 @@ class TestClassification(unittest.TestCase):
         title="A Court of Thorns and Roses / A Court of Mist and Fury / A Court of Wings and Ruin / A Court of Frost and Starlight"
         result=classify_book({"title":title,"author":"Sarah J. Maas","subjects":[]})
         self.assertEqual(result["format_type"],"collection")
-        self.assertEqual(len(result["matched_titles"]),4)
+
+    def test_verified_series_box_set_represents_all_known_volumes(self):
+        result=classify_book({"title":"A Court of Thorns and Roses Hardcover Box Set","author":"Sarah J. Maas","subjects":[]})
+        self.assertEqual(result["format_type"],"collection")
+        self.assertEqual(result["series_id"],"acotar")
+        self.assertEqual(len(result["matched_titles"]),5)
 
     def test_collection_overlap_is_only_partially_counted(self):
         collection="A Court of Thorns and Roses / A Court of Mist and Fury / A Court of Wings and Ruin / A Court of Frost and Starlight"
