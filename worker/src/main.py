@@ -2,7 +2,7 @@ from workers import WorkerEntrypoint, Response
 from durable.identity import IdentityDO
 from durable.user import UserDO
 from durable.catalog import CatalogShardDO
-from dna.mappings import classify_book
+from dna.mappings import classify_book, map_subjects
 from security.tokens import create_token, verify_token
 from booktok import WORKS as BOOKTOK_WORKS, CATEGORIES as BOOKTOK_CATEGORIES, SOURCES as BOOKTOK_SOURCES, UPDATED as BOOKTOK_UPDATED
 from js import fetch, Object, Request
