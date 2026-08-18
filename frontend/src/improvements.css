@@ -1,6 +1,18 @@
 .collection-scroll {
   position: relative;
 }
+.collection-tabs,
+.filter-tabs {
+  scrollbar-width: none;
+}
+.collection-tabs::-webkit-scrollbar,
+.filter-tabs::-webkit-scrollbar {
+  display: none;
+}
+.collection-tabs button,
+.filter-tabs button {
+  flex: 0 0 auto;
+}
 .collection-scroll:after {
   content: "";
   position: absolute;

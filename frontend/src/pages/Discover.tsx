@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   useInfiniteQuery,
   useMutation,
@@ -57,6 +57,8 @@ export function Discover() {
     { book: Book; status: LibraryStatus } | undefined
   >();
   const [slow, setSlow] = useState(false);
+  const collectionRail = useRef<HTMLDivElement>(null);
+  const activeCollection = useRef<HTMLButtonElement>(null);
   const queryClient = useQueryClient();
   const isBookTok = activeQuery.startsWith("booktok:");
   const sortOptions = isBookTok ? booktokSortOptions : standardSortOptions;
@@ -90,6 +92,15 @@ export function Discover() {
     const timer = window.setTimeout(() => setSlow(true), 5000);
     return () => window.clearTimeout(timer);
   }, [search.isFetching, activeQuery]);
+  useEffect(() => {
+    const rail = collectionRail.current;
+    const active = activeCollection.current;
+    if (!rail || !active) return;
+    rail.scrollTo({
+      left: active.offsetLeft - (rail.clientWidth - active.clientWidth) / 2,
+      behavior: "smooth",
+    });
+  }, [activeQuery, collections.data]);
   useEffect(() => {
     if (!session.data || params.get("save") !== "pending") return;
     try {
@@ -254,10 +265,20 @@ export function Discover() {
         <button>Search</button>
       </form>
       <div className="collection-scroll">
-        <div className="collection-tabs" aria-label="Browse collections">
+        <div
+          className="collection-tabs"
+          aria-label="Browse collections"
+          ref={collectionRail}
+        >
           {collections.data?.collections.map((item) => (
             <button
               key={item.id}
+              ref={
+                activeQuery === item.query ||
+                (item.id === "booktok" && isBookTok)
+                  ? activeCollection
+                  : undefined
+              }
               className={
                 activeQuery === item.query ||
                 (item.id === "booktok" && isBookTok)
