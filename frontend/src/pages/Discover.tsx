@@ -387,6 +387,16 @@ export function Discover() {
           <button onClick={() => search.refetch()}>try again</button>.
         </div>
       )}
+      {firstPage?.degraded && !search.isFetching && (
+        <div className="slow-search" role="status">
+          Showing fast matches from BookDNA's local catalogue while the global
+          catalogue is taking too long.{" "}
+          <button type="button" onClick={() => search.refetch()}>
+            Try the global catalogue again
+          </button>
+          .
+        </div>
+      )}
       {search.error && (
         <div className="error">
           {search.error.message}{" "}

@@ -1,7 +1,7 @@
 export type SupportingBook={id:string;title:string;author?:string;rating?:number;favourite:boolean;evidence:number}
 export type Trait = { id: string; name: string; category: string; score: number; confidence: number; supporting_books?:SupportingBook[] }
 export type Book = { id: string; title: string; author: string; year?: number; cover_url?: string; subjects?: string[]; edition_count?: number; isbn?: string[]; source?: string; status?: LibraryStatus; rating?: number; favourite?: boolean; dnf_reason?: string; private_note?:string; booktok_category?:string }
-export type BookSearch = { books: Book[]; page: number; limit: number; total: number; has_more: boolean; source: string; collection?:{updated:string;description:string;categories:string[];sources:{name:string;url:string}[]} }
+export type BookSearch = { books: Book[]; page: number; limit: number; total: number | null; has_more: boolean; source: string; degraded?: boolean; collection?:{updated:string;description:string;categories:string[];sources:{name:string;url:string}[]} }
 export type BookCollection = { id: string; name: string; query: string }
 export type LibraryStatus = 'READ' | 'CURRENTLY_READING' | 'WANT_TO_READ' | 'DNF'
 export type User = { id: string; username: string }

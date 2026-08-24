@@ -3,10 +3,11 @@ from durable.identity import IdentityDO
 from durable.user import UserDO
 from durable.catalog import CatalogShardDO
 from dna.mappings import classify_book, map_subjects
+from search_policy import catalog_year, local_search_text, merge_books, remote_wait_seconds
 from security.tokens import create_token, verify_token
 from booktok import WORKS as BOOKTOK_WORKS, CATEGORIES as BOOKTOK_CATEGORIES, SOURCES as BOOKTOK_SOURCES, UPDATED as BOOKTOK_UPDATED
-from js import fetch, Object, Request
-from pyodide.ffi import to_js as _to_js
+from js import fetch, Object, Request, caches
+from pyodide.ffi import create_proxy, to_js as _to_js
 from urllib.parse import urlparse, parse_qs, quote, unquote
 import hashlib
 import secrets
@@ -99,7 +100,7 @@ class Default(WorkerEntrypoint):
             if path=="/api/auth/account" and method=="DELETE": return await self.delete_account(request)
             if path=="/api/admin/stats" and method=="GET": return await self.admin_stats(request)
             if path=="/api/admin/dna-diagnostic" and method=="GET": return await self.admin_dna_diagnostic(request,parse_qs(url.query))
-            if path=="/api/books/search" and method=="GET": return await self.search(parse_qs(url.query))
+            if path=="/api/books/search" and method=="GET": return await self.cached_search(request,parse_qs(url.query))
             if path=="/api/books/catalog/status" and method=="GET": return await self.catalog_status()
             if path.startswith("/api/books/isbn/") and method=="GET": return await self.by_isbn(unquote(path.removeprefix("/api/books/isbn/")))
             if path.startswith("/api/books/") and path.endswith("/editions") and method=="GET": return await self.book_editions(unquote(path.removeprefix("/api/books/").removesuffix("/editions")))
@@ -223,12 +224,12 @@ class Default(WorkerEntrypoint):
         return [binding for index in range(8) if (binding:=getattr(self.env,f"CATALOG_SEARCH_{index}",None)) is not None]
 
     def search_terms(self,query):
-        value=query.split(":",1)[-1] if query.startswith("subject:") else query
+        value=local_search_text(query)
         words=re.findall(r"[\w]+",value,flags=re.UNICODE)[:8]
         return " AND ".join(f'"{word.replace(chr(34),"")}"*' for word in words)
 
     def sort_key(self,row,sort_name):
-        year=int(row.get("first_publish_year") or row.get("year") or 0); title=str(row.get("title") or "").casefold(); editions=int(row.get("edition_count") or 0); rank=float(row.get("rank",0))
+        year=catalog_year(row); title=str(row.get("title") or "").casefold(); editions=int(row.get("edition_count") or 0); rank=float(row.get("rank",0))
         if sort_name=="popular": return (-editions,title,str(row.get("id","")))
         if sort_name=="newest": return (year<=0,-year,title,str(row.get("id","")))
         if sort_name=="oldest": return (year<=0,year if year>0 else 9999,title,str(row.get("id","")))
@@ -268,13 +269,14 @@ class Default(WorkerEntrypoint):
         return [self.local_book(row) for row in rows[offset:offset+limit]]
 
     async def openlibrary_search(self,query,limit,offset,sort_name):
-        options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
+        options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))},"cf":{"cacheEverything":True,"cacheTtl":300}})
         upstream_sort={"relevance":"","popular":"editions","newest":"new","oldest":"old","title_asc":"title","title_desc":"title"}[sort_name]
         sort_part=f"&sort={quote(upstream_sort)}" if upstream_sort else ""
         # ISBN arrays are not displayed in search results and add substantially to
         # popular-title payloads. The ISBN endpoint remains available when needed.
         fields="key,title,author_name,first_publish_year,cover_i,subject,edition_count"
-        base_url=f"https://openlibrary.org/search.json?q={quote(query)}&limit={limit}&fields={fields}{sort_part}"
+        open_library_base=str(getattr(self.env,"OPEN_LIBRARY_BASE_URL","https://openlibrary.org")).rstrip("/")
+        base_url=f"{open_library_base}/search.json?q={quote(query)}&limit={limit}&fields={fields}{sort_part}"
         result=await asyncio.wait_for(fetch(f"{base_url}&offset={offset}",options),6)
         if not result.ok: raise RuntimeError("Open Library search unavailable")
         data=native(await result.json()); total=int(data.get("numFound",0))
@@ -286,6 +288,18 @@ class Default(WorkerEntrypoint):
         books=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
         if sort_name=="title_desc": books.reverse()
         return books,total
+
+    async def cached_search(self,request,params):
+        cache=caches.default; cache_key=Request.new(request.url)
+        try: cached=await cache.match(cache_key)
+        except Exception as exc:
+            print(f"Search cache read warning: {type(exc).__name__}: {exc}"); cached=None
+        if cached is not None: return cached
+        response=await self.search(params)
+        if response.status==200 and response.headers.get("X-BookDNA-Cacheable")=="1":
+            try: self.ctx.waitUntil(create_proxy(cache.put(cache_key,response.clone())))
+            except Exception as exc: print(f"Search cache write warning: {type(exc).__name__}: {exc}")
+        return response
 
     async def search(self,params):
         query=str(params.get("q",[""])[0]).strip(); page=max(1,min(100,int(params.get("page",["1"])[0] or 1))); limit=max(4,min(40,int(params.get("limit",["24"])[0] or 24))); sort_name=str(params.get("sort",["relevance"])[0])
@@ -309,27 +323,42 @@ class Default(WorkerEntrypoint):
         except Exception as exc:
             print(f"Local catalog search warning: {type(exc).__name__}: {exc}"); local=[]
         visible_local=local if mode in ("hybrid","local-first") else []
+        prior_local=[]
+        if mode in ("hybrid","local-first") and offset:
+            try: prior_local=await self.local_search(query,offset,0,language,year_from,year_to,format_name,sort_name)
+            except Exception as exc: print(f"Prior-page catalog search warning: {type(exc).__name__}: {exc}")
         if len(visible_local)>=limit:
             remote_task.cancel()
             next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
-            return reply({"books":visible_local,"page":page,"limit":limit,"total":None,"has_more":True,"cursor":next_cursor,"source":"catalog"},headers={"Cache-Control":"public, max-age=60, stale-while-revalidate=300"})
-        try: remote,total=await remote_task
+            return reply({"books":visible_local,"page":page,"limit":limit,"total":None,"has_more":True,"cursor":next_cursor,"source":"catalog","sort":sort_name},headers={"Cache-Control":"public, max-age=60, s-maxage=300, stale-while-revalidate=86400","X-BookDNA-Cacheable":"1"})
+        remote_limit=min(100,limit+len(visible_local)+len(prior_local))
+        if remote_limit>limit:
+            remote_task.cancel()
+            remote_task=asyncio.create_task(self.openlibrary_search(query,remote_limit,offset,sort_name))
+        remote_budget=remote_wait_seconds(mode,len(visible_local))
+        try:
+            remote,total=await asyncio.wait_for(remote_task,remote_budget) if remote_budget else await remote_task
         except asyncio.TimeoutError:
-            if visible_local: remote=[]; total=offset+len(visible_local)
+            if visible_local:
+                books=visible_local[:limit]; has_more=len(visible_local)>=limit
+                return reply({"books":books,"page":page,"limit":limit,"total":None,"has_more":has_more,"cursor":base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("="),"source":"catalog","sort":sort_name,"degraded":True},headers={"Cache-Control":"no-store","X-BookDNA-Cacheable":"0"})
             else: return reply({"detail":"The book catalog took too long to respond. Please try again."},504)
         except Exception:
-            if visible_local: remote=[]; total=offset+len(visible_local)
+            if visible_local:
+                books=visible_local[:limit]; has_more=len(visible_local)>=limit
+                return reply({"books":books,"page":page,"limit":limit,"total":None,"has_more":has_more,"cursor":base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("="),"source":"catalog","sort":sort_name,"degraded":True},headers={"Cache-Control":"no-store","X-BookDNA-Cacheable":"0"})
             else: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
-        seen={book["id"] for book in visible_local}; books=visible_local+[book for book in remote if book["id"] not in seen]; books=books[:limit]
+        books=merge_books(visible_local,remote,limit,excluded=prior_local)
         # Search results do not wait for optional cache writes; local catalog imports own persistence.
         next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
-        return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":offset+limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary","sort":sort_name},headers={"Cache-Control":"public, max-age=60, stale-while-revalidate=300"})
+        return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":offset+limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary","sort":sort_name},headers={"Cache-Control":"public, max-age=60, s-maxage=300, stale-while-revalidate=86400","X-BookDNA-Cacheable":"1"})
 
     async def booktok_search(self,query,sort_name,page,limit):
         requested=query.split(":",1)[1].replace("-"," ").casefold(); allowed={category.casefold():category for category in BOOKTOK_CATEGORIES}
         if requested not in allowed: return reply({"detail":"Unknown BookTok category"},422)
         selected=[(work_id,category,index) for index,(work_id,category) in enumerate(BOOKTOK_WORKS) if requested=="all" or category.casefold()==requested]
-        if not selected: return reply({"books":[],"page":page,"limit":limit,"total":0,"has_more":False,"source":"booktok","sort":sort_name})
+        cache_headers={"Cache-Control":"public, max-age=60, s-maxage=300, stale-while-revalidate=86400","X-BookDNA-Cacheable":"1"}
+        if not selected: return reply({"books":[],"page":page,"limit":limit,"total":0,"has_more":False,"source":"booktok","sort":sort_name},headers=cache_headers)
         expression=" OR ".join(f"/works/{work_id}" for work_id,_,_ in selected); options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
         try: result=await asyncio.wait_for(fetch(f"https://openlibrary.org/search.json?q={quote(f'key:({expression})')}&limit={len(selected)}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn",options),8)
         except asyncio.TimeoutError: return reply({"detail":"The BookTok collection took too long to respond. Please try again."},504)
@@ -345,7 +374,7 @@ class Default(WorkerEntrypoint):
         elif sort_name=="oldest": books.sort(key=lambda book:(book.get("year") is None,int(book.get("year") or 9999),book["title"].casefold()))
         else: books.sort(key=lambda book:(book["title"].casefold(),book["id"]),reverse=sort_name=="title_desc")
         offset=(page-1)*limit; visible=books[offset:offset+limit]
-        return reply({"books":visible,"page":page,"limit":limit,"total":len(books),"has_more":offset+limit<len(books),"source":"booktok","sort":sort_name,"collection":{"updated":BOOKTOK_UPDATED,"sources":BOOKTOK_SOURCES,"categories":BOOKTOK_CATEGORIES,"description":"A dated editorial collection drawn from current BookTok reading lists and long-running community favourites."}})
+        return reply({"books":visible,"page":page,"limit":limit,"total":len(books),"has_more":offset+limit<len(books),"source":"booktok","sort":sort_name,"collection":{"updated":BOOKTOK_UPDATED,"sources":BOOKTOK_SOURCES,"categories":BOOKTOK_CATEGORIES,"description":"A dated editorial collection drawn from current BookTok reading lists and long-running community favourites."}},headers=cache_headers)
 
     async def catalog_mode(self):
         database=getattr(self.env,"CATALOG_DB",None)
@@ -433,7 +462,11 @@ class Default(WorkerEntrypoint):
         if not source: return reply({"detail":"Book not found in your library"},404)
         excluded={book["id"] for book in library}; subjects=[str(value) for value in source.get("subjects",[]) if len(str(value))<80][:4]; theme_query="subject:"+(subjects[0] if subjects else " ".join(map_subjects(source.get("subjects",[]))[0]["name"].split()) if map_subjects(source.get("subjects",[])) else source["title"])
         async def find(query):
-            result=await self.search({"q":[query],"limit":["12"],"page":["1"]}); data=native(await result.json()); return data.get("books",[])
+            try:
+                result=await asyncio.wait_for(self.search({"q":[query],"limit":["12"],"page":["1"]}),2)
+            except asyncio.TimeoutError:
+                return []
+            data=native(await result.json()); return data.get("books",[])
         themed,author=await asyncio.gather(find(theme_query),find(f'author:{source.get("author","")}'))
         def clean(items,kind):
             output=[]
