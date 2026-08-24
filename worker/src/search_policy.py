@@ -5,6 +5,12 @@ HYBRID_REMOTE_BUDGET_SECONDS = 1.5
 LOCAL_FIELD_PREFIXES = ("subject:", "subject_key:", "author:")
 
 
+def cache_key_url(url: str, catalog_mode: str) -> str:
+    """Keep search caches isolated when the public catalog mode changes."""
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}__bookdna_catalog_mode={catalog_mode}"
+
+
 def remote_wait_seconds(mode: str, local_count: int) -> float | None:
     """Limit enrichment latency only when hybrid search already has results."""
     if mode in ("hybrid", "local-first") and local_count > 0:

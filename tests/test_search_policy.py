@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "worker" / "src"))
 
 from search_policy import (
     HYBRID_REMOTE_BUDGET_SECONDS,
+    cache_key_url,
     catalog_year,
     local_search_text,
     merge_books,
@@ -13,6 +14,16 @@ from search_policy import (
 
 
 class TestSearchPolicy(__import__("unittest").TestCase):
+    def test_cache_key_isolated_by_catalog_mode(self):
+        self.assertEqual(
+            cache_key_url("https://bookdna.uk/api/books/search?q=adventure", "hybrid"),
+            "https://bookdna.uk/api/books/search?q=adventure&__bookdna_catalog_mode=hybrid",
+        )
+        self.assertEqual(
+            cache_key_url("https://bookdna.uk/api/books/search", "shadow"),
+            "https://bookdna.uk/api/books/search?__bookdna_catalog_mode=shadow",
+        )
+
     def test_hybrid_limits_remote_wait_when_local_results_exist(self):
         self.assertEqual(remote_wait_seconds("hybrid", 1), HYBRID_REMOTE_BUDGET_SECONDS)
         self.assertEqual(remote_wait_seconds("local-first", 12), HYBRID_REMOTE_BUDGET_SECONDS)

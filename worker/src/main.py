@@ -3,7 +3,7 @@ from durable.identity import IdentityDO
 from durable.user import UserDO
 from durable.catalog import CatalogShardDO
 from dna.mappings import classify_book, map_subjects
-from search_policy import catalog_year, local_search_text, merge_books, remote_wait_seconds
+from search_policy import cache_key_url, catalog_year, local_search_text, merge_books, remote_wait_seconds
 from security.tokens import create_token, verify_token
 from booktok import WORKS as BOOKTOK_WORKS, CATEGORIES as BOOKTOK_CATEGORIES, SOURCES as BOOKTOK_SOURCES, UPDATED as BOOKTOK_UPDATED
 from js import fetch, Object, Request, caches
@@ -290,7 +290,8 @@ class Default(WorkerEntrypoint):
         return books,total
 
     async def cached_search(self,request,params):
-        cache=caches.default; cache_key=Request.new(request.url)
+        mode=await self.catalog_mode()
+        cache=caches.default; cache_key=Request.new(cache_key_url(request.url,mode))
         try: cached=await cache.match(cache_key)
         except Exception as exc:
             print(f"Search cache read warning: {type(exc).__name__}: {exc}"); cached=None
