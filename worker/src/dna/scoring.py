@@ -25,6 +25,11 @@ def display_score(evidence: float, total_evidence: float, prior: float = 1.8) ->
     # Affinity is relative, confidence prevents one book from claiming certainty.
     return round(min(100, raw_affinity * confidence * 180), 1)
 
+def calibrated_display_score(evidence: float, total_evidence: float, supporting_books: int) -> float:
+    """Prevent one book from looking like an established preference."""
+    score = display_score(evidence, total_evidence)
+    return min(score, 55) if supporting_books <= 1 else score
+
 def similarity(left: dict[str, float], right: dict[str, float]) -> float:
     keys = set(left) | set(right)
     if not keys:
@@ -33,4 +38,3 @@ def similarity(left: dict[str, float], right: dict[str, float]) -> float:
     a = sum(left.get(k, 0) ** 2 for k in keys) ** .5
     b = sum(right.get(k, 0) ** 2 for k in keys) ** .5
     return round(100 * dot / (a * b), 1) if a and b else 0
-

@@ -1,11 +1,13 @@
 export type SupportingBook={id:string;title:string;author?:string;rating?:number;favourite:boolean;evidence:number}
 export type Trait = { id: string; name: string; category: string; score: number; confidence: number; supporting_books?:SupportingBook[] }
 export type Book = { id: string; title: string; author: string; year?: number; cover_url?: string; subjects?: string[]; edition_count?: number; isbn?: string[]; source?: string; status?: LibraryStatus; rating?: number; favourite?: boolean; dnf_reason?: string; private_note?:string; booktok_category?:string }
-export type BookSearch = { books: Book[]; page: number; limit: number; total: number; has_more: boolean; source: string; collection?:{updated:string;description:string;categories:string[];sources:{name:string;url:string}[]} }
+export type BookSearch = { books: Book[]; page: number; limit: number; total: number | null; has_more: boolean; source: string; degraded?: boolean; collection?:{updated:string;description:string;categories:string[];sources:{name:string;url:string}[]} }
 export type BookCollection = { id: string; name: string; query: string }
 export type LibraryStatus = 'READ' | 'CURRENTLY_READING' | 'WANT_TO_READ' | 'DNF'
 export type User = { id: string; username: string }
 export type Profile = User & { email:string;display_name?:string;timezone:string;date_format:string;language:string;avatar:string }
-export type DnaProfile={traits:Trait[];evidence:number;profile_confidence:number;confidence_label:string;books_shaping:number;completed_books:number;active_traits:number;active_categories:number}
+export type CompletedClassification={id:string;title:string;author?:string;included:boolean;state:'included'|'needs_classification'|'partial_collection'|'duplicate_excluded';reason:string;reading_type:'academic'|'recreational';classification_source:'subjects'|'title_author_fallback'|'verified_series'|'none';traits:string[];format_type:'single'|'collection';series_name?:string;contained_titles:string[];counted_titles:string[];duplicate_titles:string[]}
+export type DnaProfile={classifier_version:string;traits:Trait[];evidence:number;profile_confidence:number;confidence_label:string;books_shaping:number;completed_books:number;total_books:number;completion_rate:number;active_traits:number;active_categories:number;unclassified_books:number;completed_classifications:CompletedClassification[]}
+export type DnaDiagnostic={email:string;user_id:string;coverage_percent:number;profile:DnaProfile}
 export type RecommendationBook=Book&{reason:string}
-export type AdminStats = { totals: { registrations:number; logins:number; active_24h:number; active_30d:number; books_saved:number; dna_generated:number }; daily: { day:string; registrations:number; logins:number; books_saved:number; dna_generated:number }[] }
+export type AdminStats = { totals: { registrations:number; logins:number; active_24h:number; active_30d:number; books_saved:number; dna_generated:number;dna_failed:number }; daily: { day:string; registrations:number; logins:number; books_saved:number; dna_generated:number }[] }

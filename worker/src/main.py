@@ -2,11 +2,12 @@ from workers import WorkerEntrypoint, Response
 from durable.identity import IdentityDO
 from durable.user import UserDO
 from durable.catalog import CatalogShardDO
-from dna.mappings import map_subjects
+from dna.mappings import classify_book, map_subjects
+from search_policy import cache_key_url, catalog_year, local_search_text, merge_books, remote_wait_seconds
 from security.tokens import create_token, verify_token
 from booktok import WORKS as BOOKTOK_WORKS, CATEGORIES as BOOKTOK_CATEGORIES, SOURCES as BOOKTOK_SOURCES, UPDATED as BOOKTOK_UPDATED
-from js import fetch, Object, Request
-from pyodide.ffi import to_js as _to_js
+from js import fetch, Object, Request, caches
+from pyodide.ffi import create_proxy, to_js as _to_js
 from urllib.parse import urlparse, parse_qs, quote, unquote
 import hashlib
 import secrets
@@ -42,8 +43,13 @@ class Default(WorkerEntrypoint):
         if not value and getattr(self.env,"APP_ENV","development")=="production": raise RuntimeError("Authentication is not configured")
         return str(value or "local-development-only-change-me")
 
-    def user(self,request):
+    def token_user(self,request):
         token=cookies(request).get("bookdna_access"); return verify_token(token,self.signing_secret()) if token else None
+
+    async def user(self,request):
+        user=self.token_user(request)
+        if not user or not await self.env.IDENTITY.getByName("primary").session_active(user.get("sub"),user.get("sid")): return None
+        return user
 
     def origin_ok(self,request):
         origin=request.headers.get("Origin"); host=request.headers.get("Host")
@@ -52,17 +58,24 @@ class Default(WorkerEntrypoint):
         parsed=urlparse(origin)
         return parsed.scheme=="https" and parsed.netloc==host
 
-    def auth_cookie(self,user):
-        token=create_token(user["id"],secrets.token_hex(12),self.signing_secret())
+    def auth_cookie(self,user,session_id,remember=True):
+        lifetime=30*86400 if remember else 12*3600; token=create_token(user["id"],session_id,self.signing_secret(),lifetime,remember)
         secure="; Secure" if getattr(self.env,"APP_ENV","development")=="production" else ""
-        return f"bookdna_access={token}; Path=/; Max-Age=900; HttpOnly; SameSite=Lax{secure}"
+        persistent=f"; Max-Age={lifetime}" if remember else ""
+        return f"bookdna_access={token}; Path=/; HttpOnly; SameSite=Lax{secure}{persistent}"
 
     def client_key(self,request):
         return str(request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or "local").split(",")[0].strip()
 
-    def is_admin(self,request):
-        user=self.user(request); configured=str(getattr(self.env,"ADMIN_USER_IDS","")).split(",")
-        return bool(user and user.get("sub") in {value.strip() for value in configured if value.strip()})
+    async def is_admin(self,request):
+        user=await self.user(request)
+        if not user: return False
+        configured_ids={value.strip() for value in str(getattr(self.env,"ADMIN_USER_IDS","")).split(",") if value.strip()}
+        if user.get("sub") in configured_ids: return True
+        configured_emails={value.strip().casefold() for value in str(getattr(self.env,"ADMIN_EMAILS","")).split(",") if value.strip()}
+        if not configured_emails: return False
+        profile=native(await self.env.IDENTITY.getByName("primary").profile(user["sub"]))
+        return str(profile.get("email","")).casefold() in configured_emails
 
     async def fetch(self,request):
         try:
@@ -78,14 +91,16 @@ class Default(WorkerEntrypoint):
             if path=="/api/health" and method=="GET": return reply({"status":"ok","service":"bookdna","build":"global-catalog-20260811"})
             if path=="/api/auth/register" and method=="POST": return await self.register(request)
             if path=="/api/auth/login" and method=="POST": return await self.login(request)
-            if path=="/api/auth/logout" and method=="POST": return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
+            if path=="/api/auth/logout" and method=="POST": return await self.logout(request)
+            if path=="/api/auth/logout-all" and method=="POST": return await self.logout_all(request)
             if path=="/api/auth/me" and method=="GET": return await self.me(request)
             if path=="/api/auth/profile" and method=="GET": return await self.profile(request)
             if path=="/api/auth/profile" and method=="PUT": return await self.update_profile(request)
             if path=="/api/auth/password" and method=="PUT": return await self.change_password(request)
             if path=="/api/auth/account" and method=="DELETE": return await self.delete_account(request)
             if path=="/api/admin/stats" and method=="GET": return await self.admin_stats(request)
-            if path=="/api/books/search" and method=="GET": return await self.search(parse_qs(url.query))
+            if path=="/api/admin/dna-diagnostic" and method=="GET": return await self.admin_dna_diagnostic(request,parse_qs(url.query))
+            if path=="/api/books/search" and method=="GET": return await self.cached_search(request,parse_qs(url.query))
             if path=="/api/books/catalog/status" and method=="GET": return await self.catalog_status()
             if path.startswith("/api/books/isbn/") and method=="GET": return await self.by_isbn(unquote(path.removeprefix("/api/books/isbn/")))
             if path.startswith("/api/books/") and path.endswith("/editions") and method=="GET": return await self.book_editions(unquote(path.removeprefix("/api/books/").removesuffix("/editions")))
@@ -118,47 +133,65 @@ class Default(WorkerEntrypoint):
         return native(await request.json())
 
     async def register(self,request):
-        body=await self.body(request); username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip(); password=str(body.get("password",""))
+        body=await self.body(request); username=str(body.get("username","")).strip(); email=str(body.get("email","")).strip(); password=str(body.get("password","")); remember=body.get("remember",True) is not False
         if len(username)<3 or len(username)>30 or not username.replace("_","").isalnum() or "@" not in email or len(password)<8: return reply({"detail":"Invalid registration details"},422)
         identity=self.env.IDENTITY.getByName("primary")
         if not await identity.rate_limit(f"register:{self.client_key(request)}",5,3600): return reply({"detail":"Too many registration attempts. Please try again later."},429)
         user=native(await identity.register(username,email,password))
         if user.get("error"): return reply({"detail":user["error"]},409)
         await self.env.USERS.getByName(user["id"]).initialize(user["id"],user["username"])
-        return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
+        session_id=await identity.create_session(user["id"],30*86400 if remember else 12*3600)
+        return reply(user,headers={"Set-Cookie":self.auth_cookie(user,session_id,remember)})
 
     async def login(self,request):
-        body=await self.body(request); identity=self.env.IDENTITY.getByName("primary"); identifier=str(body.get("identifier","")).strip().casefold(); bucket=hashlib.sha256(identifier.encode()).hexdigest()[:20]
+        body=await self.body(request); identity=self.env.IDENTITY.getByName("primary"); identifier=str(body.get("identifier","")).strip().casefold(); bucket=hashlib.sha256(identifier.encode()).hexdigest()[:20]; remember=body.get("remember",True) is not False
         if not await identity.rate_limit(f"login:{self.client_key(request)}:{bucket}",10,900): return reply({"detail":"Too many login attempts. Please wait and try again."},429)
         user=native(await identity.authenticate(identifier,str(body.get("password",""))))
         if user.get("error"): return reply({"detail":user["error"]},401)
-        return reply(user,headers={"Set-Cookie":self.auth_cookie(user)})
+        session_id=await identity.create_session(user["id"],30*86400 if remember else 12*3600)
+        return reply(user,headers={"Set-Cookie":self.auth_cookie(user,session_id,remember)})
+
+    async def logout(self,request):
+        user=self.token_user(request)
+        if user: await self.env.IDENTITY.getByName("primary").revoke_session(user.get("sub"),user.get("sid"))
+        return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
+
+    async def logout_all(self,request):
+        user=await self.user(request)
+        if not user: return reply({"detail":"Sign in required"},401)
+        await self.env.IDENTITY.getByName("primary").revoke_all_sessions(user["sub"])
+        return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
 
     async def me(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        username=await self.env.IDENTITY.getByName("primary").username_for(user["sub"]); return reply({"id":user["sub"],"username":username})
+        username=await self.env.IDENTITY.getByName("primary").username_for(user["sub"])
+        if not username: return reply({"detail":"Sign in required"},401)
+        lifetime=30*86400 if user.get("rem") else 12*3600
+        await self.env.IDENTITY.getByName("primary").renew_session(user["sub"],user["sid"],lifetime)
+        return reply({"id":user["sub"],"username":username},headers={"Set-Cookie":self.auth_cookie({"id":user["sub"]},user["sid"],bool(user.get("rem")))})
 
     async def profile(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         return reply(native(await self.env.IDENTITY.getByName("primary").profile(user["sub"])))
 
     async def update_profile(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").update_profile(user["sub"],body.get("display_name"),body.get("timezone"),body.get("date_format"),body.get("language"),body.get("avatar")))
         return reply({"detail":result["error"]},422) if result.get("error") else reply(result)
 
     async def change_password(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").change_password(user["sub"],str(body.get("current_password","")),str(body.get("new_password",""))))
         if result.get("error"): return reply({"detail":result["error"]},422)
-        return reply(result,headers={"Set-Cookie":self.auth_cookie({"id":user["sub"]})})
+        session_id=await self.env.IDENTITY.getByName("primary").create_session(user["sub"],30*86400)
+        return reply(result,headers={"Set-Cookie":self.auth_cookie({"id":user["sub"]},session_id,True)})
 
     async def delete_account(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); result=native(await self.env.IDENTITY.getByName("primary").delete_account(user["sub"],str(body.get("password",""))))
         if result.get("error"): return reply({"detail":result["error"]},403)
@@ -166,7 +199,7 @@ class Default(WorkerEntrypoint):
         return reply({"ok":True},headers={"Set-Cookie":"bookdna_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"})
 
     async def admin_stats(self,request):
-        if not self.is_admin(request): return reply({"detail":"Not found"},404)
+        if not await self.is_admin(request): return reply({"detail":"Not found"},404)
         return reply(native(await self.env.IDENTITY.getByName("primary").admin_stats()))
 
     def book_from_openlibrary(self,item):
@@ -191,12 +224,12 @@ class Default(WorkerEntrypoint):
         return [binding for index in range(8) if (binding:=getattr(self.env,f"CATALOG_SEARCH_{index}",None)) is not None]
 
     def search_terms(self,query):
-        value=query.split(":",1)[-1] if query.startswith("subject:") else query
+        value=local_search_text(query)
         words=re.findall(r"[\w]+",value,flags=re.UNICODE)[:8]
         return " AND ".join(f'"{word.replace(chr(34),"")}"*' for word in words)
 
     def sort_key(self,row,sort_name):
-        year=int(row.get("first_publish_year") or row.get("year") or 0); title=str(row.get("title") or "").casefold(); editions=int(row.get("edition_count") or 0); rank=float(row.get("rank",0))
+        year=catalog_year(row); title=str(row.get("title") or "").casefold(); editions=int(row.get("edition_count") or 0); rank=float(row.get("rank",0))
         if sort_name=="popular": return (-editions,title,str(row.get("id","")))
         if sort_name=="newest": return (year<=0,-year,title,str(row.get("id","")))
         if sort_name=="oldest": return (year<=0,year if year>0 else 9999,title,str(row.get("id","")))
@@ -213,7 +246,10 @@ class Default(WorkerEntrypoint):
         if year_to: clauses.append("CAST(substr(w.published,1,4) AS INTEGER)<=?"); values.append(year_to)
         if format_name: clauses.append("lower(w.format)=lower(?)"); values.append(format_name)
         orders={"relevance":"rank,CASE w.quality WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,w.edition_count DESC,w.id","popular":"w.edition_count DESC,lower(w.title),w.id","newest":"CASE WHEN w.published IS NULL OR w.published='' THEN 1 ELSE 0 END,CAST(substr(w.published,1,4) AS INTEGER) DESC,lower(w.title),w.id","oldest":"CASE WHEN w.published IS NULL OR w.published='' THEN 1 ELSE 0 END,CAST(substr(w.published,1,4) AS INTEGER),lower(w.title),w.id","title_asc":"lower(w.title),w.id","title_desc":"lower(w.title) DESC,w.id DESC"}
-        sql=f"SELECT w.*,bm25(search_works_fts) rank FROM search_works_fts JOIN search_works w ON w.id=search_works_fts.id WHERE {' AND '.join(clauses)} ORDER BY {orders[sort_name]} LIMIT ?"
+        # Keep the cross-shard response small. In particular, sources_json can be
+        # sizeable and is only needed on the book detail endpoint.
+        columns="w.id,w.title,w.author,w.language,w.published,w.format,w.quality,w.edition_count,w.cover_url"
+        sql=f"SELECT {columns},bm25(search_works_fts) rank FROM search_works_fts JOIN search_works w ON w.id=search_works_fts.id WHERE {' AND '.join(clauses)} ORDER BY {orders[sort_name]} LIMIT ?"
         values.append(limit); result=native(await database.prepare(sql).bind(*values).all())
         return result.get("results",[]) if isinstance(result,dict) else []
 
@@ -221,7 +257,7 @@ class Default(WorkerEntrypoint):
         cover=row.get("cover_url"); year=None
         if row.get("published"):
             match=re.search(r"(?:1[0-9]{3}|20[0-9]{2})",str(row["published"])); year=int(match.group()) if match else None
-        return {"id":row["id"],"title":row.get("title") or "Untitled","author":row.get("author") or "Unknown author","year":year,"cover_url":cover,"subjects":[],"edition_count":int(row.get("edition_count") or 0),"source":"catalog","quality":row.get("quality"),"language":row.get("language"),"format":row.get("format"),"sources":json.loads(row.get("sources_json") or "[]")}
+        return {"id":row["id"],"title":row.get("title") or "Untitled","author":row.get("author") or "Unknown author","year":year,"cover_url":cover,"subjects":[],"edition_count":int(row.get("edition_count") or 0),"source":"catalog","quality":row.get("quality"),"language":row.get("language"),"format":row.get("format")}
 
     async def local_search(self,query,limit,offset,language=None,year_from=None,year_to=None,format_name=None,sort_name="relevance"):
         shards=self.search_shards()
@@ -231,6 +267,40 @@ class Default(WorkerEntrypoint):
         for result in results: rows.extend(result)
         rows.sort(key=lambda row:self.sort_key(row,sort_name),reverse=sort_name=="title_desc")
         return [self.local_book(row) for row in rows[offset:offset+limit]]
+
+    async def openlibrary_search(self,query,limit,offset,sort_name):
+        options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))},"cf":{"cacheEverything":True,"cacheTtl":300}})
+        upstream_sort={"relevance":"","popular":"editions","newest":"new","oldest":"old","title_asc":"title","title_desc":"title"}[sort_name]
+        sort_part=f"&sort={quote(upstream_sort)}" if upstream_sort else ""
+        # ISBN arrays are not displayed in search results and add substantially to
+        # popular-title payloads. The ISBN endpoint remains available when needed.
+        fields="key,title,author_name,first_publish_year,cover_i,subject,edition_count"
+        open_library_base=str(getattr(self.env,"OPEN_LIBRARY_BASE_URL","https://openlibrary.org")).rstrip("/")
+        base_url=f"{open_library_base}/search.json?q={quote(query)}&limit={limit}&fields={fields}{sort_part}"
+        result=await asyncio.wait_for(fetch(f"{base_url}&offset={offset}",options),6)
+        if not result.ok: raise RuntimeError("Open Library search unavailable")
+        data=native(await result.json()); total=int(data.get("numFound",0))
+        if sort_name=="title_desc" and total:
+            reverse_offset=max(0,total-offset-limit)
+            result=await asyncio.wait_for(fetch(f"{base_url}&offset={reverse_offset}",options),6)
+            if not result.ok: raise RuntimeError("Open Library search unavailable")
+            data=native(await result.json())
+        books=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
+        if sort_name=="title_desc": books.reverse()
+        return books,total
+
+    async def cached_search(self,request,params):
+        mode=await self.catalog_mode()
+        cache=caches.default; cache_key=Request.new(cache_key_url(request.url,mode))
+        try: cached=await cache.match(cache_key)
+        except Exception as exc:
+            print(f"Search cache read warning: {type(exc).__name__}: {exc}"); cached=None
+        if cached is not None: return cached
+        response=await self.search(params)
+        if response.status==200 and response.headers.get("X-BookDNA-Cacheable")=="1":
+            try: self.ctx.waitUntil(create_proxy(cache.put(cache_key,response.clone())))
+            except Exception as exc: print(f"Search cache write warning: {type(exc).__name__}: {exc}")
+        return response
 
     async def search(self,params):
         query=str(params.get("q",[""])[0]).strip(); page=max(1,min(100,int(params.get("page",["1"])[0] or 1))); limit=max(4,min(40,int(params.get("limit",["24"])[0] or 24))); sort_name=str(params.get("sort",["relevance"])[0])
@@ -245,38 +315,51 @@ class Default(WorkerEntrypoint):
         language=str(params.get("language",[""])[0]).strip() or None; format_name=str(params.get("format",[""])[0]).strip() or None
         try: year_from=int(params.get("year_from",["0"])[0] or 0) or None; year_to=int(params.get("year_to",["0"])[0] or 0) or None
         except ValueError: return reply({"detail":"Invalid year filter"},422)
-        mode=await self.catalog_mode(); local=[]
-        try: local=await self.local_search(query,limit,offset,language,year_from,year_to,format_name,sort_name)
-        except Exception as exc: print(f"Local catalog search warning: {type(exc).__name__}: {exc}")
+        mode=await self.catalog_mode()
+        # Local D1 shards and the live fallback are independent. Run them together
+        # so hybrid/shadow searches pay the slower latency, rather than their sum.
+        local_task=asyncio.create_task(self.local_search(query,limit,offset,language,year_from,year_to,format_name,sort_name))
+        remote_task=asyncio.create_task(self.openlibrary_search(query,limit,offset,sort_name))
+        try: local=await local_task
+        except Exception as exc:
+            print(f"Local catalog search warning: {type(exc).__name__}: {exc}"); local=[]
         visible_local=local if mode in ("hybrid","local-first") else []
+        prior_local=[]
+        if mode in ("hybrid","local-first") and offset:
+            try: prior_local=await self.local_search(query,offset,0,language,year_from,year_to,format_name,sort_name)
+            except Exception as exc: print(f"Prior-page catalog search warning: {type(exc).__name__}: {exc}")
         if len(visible_local)>=limit:
+            remote_task.cancel()
             next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
-            return reply({"books":visible_local,"page":page,"limit":limit,"total":None,"has_more":True,"cursor":next_cursor,"source":"catalog"})
-        options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
-        upstream_sort={"relevance":"","popular":"editions","newest":"new","oldest":"old","title_asc":"title","title_desc":"title"}[sort_name]; sort_part=f"&sort={quote(upstream_sort)}" if upstream_sort else ""; remote_offset=offset
-        base_url=f"https://openlibrary.org/search.json?q={quote(query)}&limit={limit}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn{sort_part}"
-        try: result=await asyncio.wait_for(fetch(f"{base_url}&offset={remote_offset}",options),8)
-        except asyncio.TimeoutError: return reply({"detail":"The book catalog took too long to respond. Please try again."},504)
-        if not result.ok: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
-        data=native(await result.json()); total=int(data.get("numFound",0))
-        if sort_name=="title_desc" and total:
-            remote_offset=max(0,total-offset-limit)
-            try: result=await asyncio.wait_for(fetch(f"{base_url}&offset={remote_offset}",options),8)
-            except asyncio.TimeoutError: return reply({"detail":"The book catalog took too long to respond. Please try again."},504)
-            if not result.ok: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
-            data=native(await result.json())
-        remote=[self.book_from_openlibrary(item) for item in data.get("docs",[]) if item.get("key")]
-        if sort_name=="title_desc": remote.reverse()
-        seen={book["id"] for book in visible_local}; books=visible_local+[book for book in remote if book["id"] not in seen]; books=books[:limit]
+            return reply({"books":visible_local,"page":page,"limit":limit,"total":None,"has_more":True,"cursor":next_cursor,"source":"catalog","sort":sort_name},headers={"Cache-Control":"public, max-age=60, s-maxage=300, stale-while-revalidate=86400","X-BookDNA-Cacheable":"1"})
+        remote_limit=min(100,limit+len(visible_local)+len(prior_local))
+        if remote_limit>limit:
+            remote_task.cancel()
+            remote_task=asyncio.create_task(self.openlibrary_search(query,remote_limit,offset,sort_name))
+        remote_budget=remote_wait_seconds(mode,len(visible_local))
+        try:
+            remote,total=await asyncio.wait_for(remote_task,remote_budget) if remote_budget else await remote_task
+        except asyncio.TimeoutError:
+            if visible_local:
+                books=visible_local[:limit]; has_more=len(visible_local)>=limit
+                return reply({"books":books,"page":page,"limit":limit,"total":None,"has_more":has_more,"cursor":base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("="),"source":"catalog","sort":sort_name,"degraded":True},headers={"Cache-Control":"no-store","X-BookDNA-Cacheable":"0"})
+            else: return reply({"detail":"The book catalog took too long to respond. Please try again."},504)
+        except Exception:
+            if visible_local:
+                books=visible_local[:limit]; has_more=len(visible_local)>=limit
+                return reply({"books":books,"page":page,"limit":limit,"total":None,"has_more":has_more,"cursor":base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("="),"source":"catalog","sort":sort_name,"degraded":True},headers={"Cache-Control":"no-store","X-BookDNA-Cacheable":"0"})
+            else: return reply({"detail":"The global book catalog is temporarily unavailable"},502)
+        books=merge_books(visible_local,remote,limit,excluded=prior_local)
         # Search results do not wait for optional cache writes; local catalog imports own persistence.
         next_cursor=base64.urlsafe_b64encode(str(offset+limit).encode()).decode().rstrip("=")
-        return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":offset+limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary","sort":sort_name})
+        return reply({"books":books,"page":page,"limit":limit,"total":total,"has_more":offset+limit<total,"cursor":next_cursor,"source":"hybrid" if visible_local else "openlibrary","sort":sort_name},headers={"Cache-Control":"public, max-age=60, s-maxage=300, stale-while-revalidate=86400","X-BookDNA-Cacheable":"1"})
 
     async def booktok_search(self,query,sort_name,page,limit):
         requested=query.split(":",1)[1].replace("-"," ").casefold(); allowed={category.casefold():category for category in BOOKTOK_CATEGORIES}
         if requested not in allowed: return reply({"detail":"Unknown BookTok category"},422)
         selected=[(work_id,category,index) for index,(work_id,category) in enumerate(BOOKTOK_WORKS) if requested=="all" or category.casefold()==requested]
-        if not selected: return reply({"books":[],"page":page,"limit":limit,"total":0,"has_more":False,"source":"booktok","sort":sort_name})
+        cache_headers={"Cache-Control":"public, max-age=60, s-maxage=300, stale-while-revalidate=86400","X-BookDNA-Cacheable":"1"}
+        if not selected: return reply({"books":[],"page":page,"limit":limit,"total":0,"has_more":False,"source":"booktok","sort":sort_name},headers=cache_headers)
         expression=" OR ".join(f"/works/{work_id}" for work_id,_,_ in selected); options=js_object({"headers":{"User-Agent":str(getattr(self.env,"OPEN_LIBRARY_USER_AGENT","BookDNA/0.1"))}})
         try: result=await asyncio.wait_for(fetch(f"https://openlibrary.org/search.json?q={quote(f'key:({expression})')}&limit={len(selected)}&fields=key,title,author_name,first_publish_year,cover_i,subject,edition_count,isbn",options),8)
         except asyncio.TimeoutError: return reply({"detail":"The BookTok collection took too long to respond. Please try again."},504)
@@ -292,7 +375,7 @@ class Default(WorkerEntrypoint):
         elif sort_name=="oldest": books.sort(key=lambda book:(book.get("year") is None,int(book.get("year") or 9999),book["title"].casefold()))
         else: books.sort(key=lambda book:(book["title"].casefold(),book["id"]),reverse=sort_name=="title_desc")
         offset=(page-1)*limit; visible=books[offset:offset+limit]
-        return reply({"books":visible,"page":page,"limit":limit,"total":len(books),"has_more":offset+limit<len(books),"source":"booktok","sort":sort_name,"collection":{"updated":BOOKTOK_UPDATED,"sources":BOOKTOK_SOURCES,"categories":BOOKTOK_CATEGORIES,"description":"A dated editorial collection drawn from current BookTok reading lists and long-running community favourites."}})
+        return reply({"books":visible,"page":page,"limit":limit,"total":len(books),"has_more":offset+limit<len(books),"source":"booktok","sort":sort_name,"collection":{"updated":BOOKTOK_UPDATED,"sources":BOOKTOK_SOURCES,"categories":BOOKTOK_CATEGORIES,"description":"A dated editorial collection drawn from current BookTok reading lists and long-running community favourites."}},headers=cache_headers)
 
     async def catalog_mode(self):
         database=getattr(self.env,"CATALOG_DB",None)
@@ -353,34 +436,38 @@ class Default(WorkerEntrypoint):
         await self.cache_books(books); return reply({"book":books[0],"matches":books,"source":"openlibrary"})
 
     async def library(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         return reply({"books":native(await self.env.USERS.getByName(user["sub"]).library())})
 
     async def update_library(self,request,book_id):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         body=await self.body(request); book=body.get("book",{}); status=body.get("status"); rating=body.get("rating"); favourite=bool(body.get("favourite",False)); dnf_reason=body.get("dnf_reason"); private_note=body.get("private_note")
         if book.get("id")!=book_id or status not in ("READ","CURRENTLY_READING","WANT_TO_READ","DNF") or (rating is not None and (float(rating)<.5 or float(rating)>5)) or (dnf_reason is not None and (not isinstance(dnf_reason,str) or len(dnf_reason)>500)) or (private_note is not None and (not isinstance(private_note,str) or len(private_note)>2000)): return reply({"detail":"Invalid library update"},422)
-        traits=map_subjects(book.get("subjects",[])); shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits,dnf_reason,private_note))
+        classification=classify_book(book); traits=classification["traits"]; shard=hashlib.sha256(book_id.encode()).hexdigest()[:2]; await self.env.CATALOG.getByName(f"catalog:{shard}").put_book(book,traits); result=native(await self.env.USERS.getByName(user["sub"]).upsert_book(book,status,rating,favourite,traits,dnf_reason,private_note))
         await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"book_saved")
         return reply(result)
 
     async def remove_library_book(self,request,book_id):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         result=native(await self.env.USERS.getByName(user["sub"]).remove_book(book_id))
         if result.get("error"): return reply({"detail":result["error"]},404)
         await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"book_removed"); return reply(result)
 
     async def recommendations(self,request,book_id):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
         library=native(await self.env.USERS.getByName(user["sub"]).library()); source=next((book for book in library if book.get("id")==book_id),None)
         if not source: return reply({"detail":"Book not found in your library"},404)
         excluded={book["id"] for book in library}; subjects=[str(value) for value in source.get("subjects",[]) if len(str(value))<80][:4]; theme_query="subject:"+(subjects[0] if subjects else " ".join(map_subjects(source.get("subjects",[]))[0]["name"].split()) if map_subjects(source.get("subjects",[])) else source["title"])
         async def find(query):
-            result=await self.search({"q":[query],"limit":["12"],"page":["1"]}); data=native(await result.json()); return data.get("books",[])
+            try:
+                result=await asyncio.wait_for(self.search({"q":[query],"limit":["12"],"page":["1"]}),2)
+            except asyncio.TimeoutError:
+                return []
+            data=native(await result.json()); return data.get("books",[])
         themed,author=await asyncio.gather(find(theme_query),find(f'author:{source.get("author","")}'))
         def clean(items,kind):
             output=[]
@@ -394,6 +481,20 @@ class Default(WorkerEntrypoint):
         return reply({"source":source,"similar":clean(themed,"similar"),"by_author":clean(author,"author"),"basis":"Recommendations use catalog subjects, themes, authorship, and your existing library—not invented plot or character analysis."})
 
     async def dna(self,request):
-        user=self.user(request)
+        user=await self.user(request)
         if not user: return reply({"detail":"Sign in required"},401)
-        result=native(await self.env.USERS.getByName(user["sub"]).dna()); await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"dna_generated"); return reply(result)
+        try:
+            result=native(await self.env.USERS.getByName(user["sub"]).dna())
+        except Exception:
+            await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"dna_failed")
+            raise
+        await self.env.IDENTITY.getByName("primary").record_event(user["sub"],"dna_generated"); return reply(result)
+
+    async def admin_dna_diagnostic(self,request,query):
+        if not await self.is_admin(request): return reply({"detail":"Administrator access required"},403)
+        email=str((query.get("email") or [""])[0]).strip().casefold()
+        if "@" not in email: return reply({"detail":"Enter a valid account email"},422)
+        identity=self.env.IDENTITY.getByName("primary"); user_id=await identity.user_id_for_email(email)
+        if not user_id: return reply({"detail":"Active account not found"},404)
+        diagnostic=native(await self.env.USERS.getByName(user_id).dna_diagnostic())
+        return reply({"email":email,"user_id":user_id,**diagnostic})

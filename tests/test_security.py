@@ -14,3 +14,7 @@ class TestSecurity(__import__("unittest").TestCase):
         payload=verify_token(token,"secret")
         self.assertEqual(payload["sub"],"usr_test")
         self.assertIsNone(verify_token(token,"different"))
+
+    def test_remembered_session_is_recorded_in_token(self):
+        token=create_token("usr_test","session_test","secret",60,True)
+        self.assertTrue(verify_token(token,"secret")["rem"])

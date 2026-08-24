@@ -24,7 +24,7 @@ npm test
 
 On macOS, if `python3.13` is missing, install it with `brew install python@3.13`. The project-local `.venv` keeps BookDNA's supported Python and catalog dependencies separate from the system Python.
 
-Set `ADMIN_USER_IDS` to a comma-separated list of BookDNA user IDs to grant access to the private `/admin` dashboard. Keep this value out of source control in production.
+Set `ADMIN_USER_IDS` to a comma-separated list of BookDNA user IDs or `ADMIN_EMAILS` to a comma-separated list of normalized account emails to grant access to the private `/admin` dashboard. Keep these values out of source control in production.
 
 ## Deploy
 

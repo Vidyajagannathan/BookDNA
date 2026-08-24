@@ -1,5 +1,6 @@
 import secrets
 import time
+import hashlib
 from workers import DurableObject
 from security.tokens import hash_password, verify_password
 
@@ -53,6 +54,26 @@ class IdentityDO(DurableObject):
         self.sql.exec("INSERT INTO product_events(user_id,event_type,created_at) VALUES(?,?,?)", rows[0].id, "login", now)
         return {"id": rows[0].id, "username": rows[0].username}
 
+    async def create_session(self,user_id,lifetime):
+        session_id=secrets.token_urlsafe(24); now=int(time.time())
+        self.sql.exec("DELETE FROM refresh_sessions WHERE expires_at<? OR revoked_at IS NOT NULL",now)
+        self.sql.exec("INSERT INTO refresh_sessions(id,user_id,token_hash,expires_at,revoked_at) VALUES(?,?,?,?,NULL)",session_id,user_id,hashlib.sha256(session_id.encode()).hexdigest(),now+int(lifetime))
+        return session_id
+
+    async def session_active(self,user_id,session_id):
+        if not session_id: return False
+        digest=hashlib.sha256(session_id.encode()).hexdigest()
+        return bool(list(self.sql.exec("SELECT id FROM refresh_sessions WHERE id=? AND user_id=? AND token_hash=? AND revoked_at IS NULL AND expires_at>?",session_id,user_id,digest,int(time.time()))))
+
+    async def renew_session(self,user_id,session_id,lifetime):
+        self.sql.exec("UPDATE refresh_sessions SET expires_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL AND expires_at>?",int(time.time())+int(lifetime),session_id,user_id,int(time.time())); return True
+
+    async def revoke_session(self,user_id,session_id):
+        self.sql.exec("UPDATE refresh_sessions SET revoked_at=? WHERE id=? AND user_id=?",int(time.time()),session_id,user_id); return True
+
+    async def revoke_all_sessions(self,user_id):
+        self.sql.exec("UPDATE refresh_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",int(time.time()),user_id); return True
+
     async def username_for(self, user_id):
         rows = list(self.sql.exec("SELECT username FROM users WHERE id=? AND account_status='ACTIVE'", user_id))
         return rows[0].username if rows else None
@@ -61,6 +82,10 @@ class IdentityDO(DurableObject):
         rows=list(self.sql.exec("SELECT id,username,email_normalized email,display_name,timezone,date_format,language,avatar FROM users WHERE id=? AND account_status='ACTIVE'",user_id))
         if not rows: return {"error":"Account not found"}
         row=rows[0]; return {key:getattr(row,key) for key in ("id","username","email","display_name","timezone","date_format","language","avatar")}
+
+    async def user_id_for_email(self,email):
+        rows=list(self.sql.exec("SELECT id FROM users WHERE email_normalized=? AND account_status='ACTIVE' LIMIT 1",str(email).strip().casefold()))
+        return rows[0].id if rows else None
 
     async def update_profile(self,user_id,display_name,timezone,date_format,language,avatar):
         if language!="en" or date_format not in ("DD/MM/YYYY","MM/DD/YYYY","YYYY-MM-DD") or avatar not in ("forest","clay","gold","ocean","plum"): return {"error":"Invalid profile settings"}
@@ -97,6 +122,6 @@ class IdentityDO(DurableObject):
         month = now - 30 * 86400
         def scalar(sql, *args):
             return list(self.sql.exec(sql, *args))[0].count
-        totals = {"registrations": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE'"), "logins": scalar("SELECT count(*) count FROM product_events WHERE event_type='login'"), "active_24h": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE' AND last_activity_at>=?", day), "active_30d": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE' AND last_activity_at>=?", month), "books_saved": scalar("SELECT count(*) count FROM product_events WHERE event_type='book_saved'"), "dna_generated": scalar("SELECT count(*) count FROM product_events WHERE event_type='dna_generated'")}
+        totals = {"registrations": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE'"), "logins": scalar("SELECT count(*) count FROM product_events WHERE event_type='login'"), "active_24h": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE' AND last_activity_at>=?", day), "active_30d": scalar("SELECT count(*) count FROM users WHERE account_status='ACTIVE' AND last_activity_at>=?", month), "books_saved": scalar("SELECT count(*) count FROM product_events WHERE event_type='book_saved'"), "dna_generated": scalar("SELECT count(*) count FROM product_events WHERE event_type='dna_generated'"), "dna_failed": scalar("SELECT count(*) count FROM product_events WHERE event_type='dna_failed'")}
         daily = [{"day": row.day, "registrations": row.registrations, "logins": row.logins, "books_saved": row.books_saved, "dna_generated": row.dna_generated} for row in self.sql.exec("SELECT date(created_at,'unixepoch') day,sum(event_type='registration') registrations,sum(event_type='login') logins,sum(event_type='book_saved') books_saved,sum(event_type='dna_generated') dna_generated FROM product_events WHERE created_at>=? GROUP BY day ORDER BY day DESC LIMIT 14", month)]
         return {"totals": totals, "daily": daily}
