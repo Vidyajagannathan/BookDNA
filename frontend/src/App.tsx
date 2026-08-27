@@ -21,6 +21,7 @@ import { AccountPage } from "./pages/AccountPage";
 import { AdminPage } from "./pages/AdminPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
 import { api } from "./lib/api";
+import { Brand } from "./components/Brand";
 
 export function App() {
   const { theme, toggleTheme } = useUI();
@@ -49,8 +50,7 @@ export function App() {
     <div className="app-shell">
       <header className="topbar">
         <NavLink to="/" className="brand" aria-label="BookDNA home">
-          <span>BOOK</span>
-          <i>DNA</i>
+          <Brand />
         </NavLink>
         <nav aria-label="Primary navigation">
           <NavLink to="/discover">
@@ -111,10 +111,7 @@ export function App() {
         </Routes>
       </main>
       <footer>
-        <span className="brand small">
-          <span>BOOK</span>
-          <i>DNA</i>
-        </span>
+        <span className="brand"><Brand small /></span>
         <p>Every book leaves a trace.</p>
         <p>
           <NavLink to="/privacy">Privacy</NavLink> ·{" "}
